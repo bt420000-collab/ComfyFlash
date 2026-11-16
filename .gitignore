@@ -1,0 +1,12 @@
+/.workbuddy/
+/comfyui-workflows/
+/ComfyFlash_H3_v0.1_Agent_Development_Spec.md
+/.agents/skills/comfyflash/
+/.claude/skills/comfyflash/
+/models/*
+!/models/config.example.json
+__pycache__/
+*.py[cod]
+*.safetensors
+*.ckpt
+*.gguf
