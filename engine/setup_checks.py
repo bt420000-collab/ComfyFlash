@@ -117,6 +117,9 @@ with contextlib.redirect_stdout(sys.stderr):
                     free, total = torch.cuda.mem_get_info()
                     gpu.update(name=torch.cuda.get_device_name(), total_mib=total // 2**20,
                                free_mib=free // 2**20)
+                    uuid = getattr(torch.cuda.get_device_properties(index), "uuid", None)
+                    if uuid is not None:
+                        gpu["uuid"] = str(uuid)
                     value = torch.ones(2, device="cuda", dtype=torch.bfloat16)
                     (value + value).sum().item()
                     gpu["ready"] = True
@@ -193,20 +196,32 @@ def physical_ram_mib():
 def nvidia_inventory():
     try:
         run = subprocess.run(
-            ["nvidia-smi", "--query-gpu=index,name,memory.total,memory.free", "--format=csv,noheader,nounits"],
+            ["nvidia-smi", "--query-gpu=index,uuid,name,memory.total,memory.free", "--format=csv,noheader,nounits"],
             check=True, capture_output=True, encoding="utf-8", errors="replace", timeout=8,
         )
         return [
-            {"index": int(index), "name": name, "total_mib": int(total), "free_mib": int(free), "ready": False}
-            for index, name, total, free in (line.split(", ") for line in run.stdout.splitlines())
+            {"index": int(index), "uuid": uuid, "name": name,
+             "total_mib": int(total), "free_mib": int(free), "ready": False}
+            for index, uuid, name, total, free in (line.split(", ") for line in run.stdout.splitlines())
         ]
     except (OSError, ValueError, subprocess.SubprocessError):
         return []
 
 
 def hardware_report(runtime, preferred=None, *, inventory=False):
-    detected = nvidia_inventory() if inventory else []
-    gpus = runtime.get("gpus") or detected
+    cuda_gpus = runtime.get("gpus", [])
+    detected = nvidia_inventory() if inventory or cuda_gpus else []
+    physical_free = {
+        gpu["uuid"].lower().removeprefix("gpu-"): gpu["free_mib"]
+        for gpu in detected if gpu.get("uuid")
+    }
+    gpus = []
+    for gpu in cuda_gpus or detected:
+        device = dict(gpu)
+        uuid = gpu.get("uuid", "").lower().removeprefix("gpu-")
+        if uuid in physical_free and "free_mib" in gpu:
+            device["free_mib"] = min(gpu["free_mib"], physical_free[uuid])
+        gpus.append(device)
     ram = runtime.get("ram_mib") or (physical_ram_mib() if inventory else None)
     free_ram = runtime.get("free_ram_mib")
     usable = sorted((gpu for gpu in gpus if gpu["ready"]),

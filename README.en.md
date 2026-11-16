@@ -172,6 +172,8 @@ Registration returns a `play_argv` array containing the executable and command a
 
 For batch generation, repeat `--request` within one `play` invocation, using a distinct output path for each request. If multiple suitable GPUs are available and sufficient VRAM/system RAM is free, separate assets may run on different GPUs. Otherwise the engine falls back to sequential execution on one GPU. A single asset is handled by one GPU, and generation processes exit when the invocation completes.
 
+Batch scheduling checks free VRAM reported by CUDA and the NVIDIA device for each GPU. When a concurrent task fails under memory pressure, ComfyFlash keeps completed files and retries the failed task once on one GPU after the other tasks finish.
+
 Applications already running inside the inference Python environment may call `Flash.tone_list()`, `Flash.tone_info()`, and `Flash.play()` directly. Reusing one `with Flash()` session is useful for generating multiple assets without repeatedly loading the same models. See [engine/README.md](engine/README.md) for detailed options, model mappings, and benchmarking data.
 
 ## License

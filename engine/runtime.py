@@ -157,11 +157,24 @@ class Runtime:
         """Release temporary buffers at the same boundaries as ComfyUI's nodes."""
         try:
             yield
-        finally:
-            if self.dynamic_vram:
-                self._mod("comfy.model_prefetch").cleanup_prefetch_queues()
-                self.mm.reset_cast_buffers()
-                self._mod("comfy_aimdo.model_vbar").vbars_reset_watermark_limits()
+        except BaseException:
+            try:
+                self._cleanup_stage()
+            except Exception:
+                logging.getLogger(__name__).warning("Error releasing stage buffers", exc_info=True)
+            raise
+        else:
+            self._cleanup_stage()
+
+    def _cleanup_stage(self):
+        if self.dynamic_vram:
+            self._mod("comfy.model_prefetch").cleanup_prefetch_queues()
+            self.mm.reset_cast_buffers()
+            self._mod("comfy_aimdo.model_vbar").vbars_reset_watermark_limits()
+
+    def is_oom(self, exc):
+        check = getattr(self._mods.get("comfy.model_management"), "is_oom", None)
+        return bool(check and check(exc))
 
     # ---------------------------------------------------------------- imports
     def _mod(self, name: str):

@@ -163,6 +163,8 @@ python -B engine/agent.py register --comfyui-root "D:/ComfyUI/ComfyUI" --models-
 
 批量生成时，在同一次 `play` 命令中重复传入 `--request`，每个请求使用独立的输出路径。检测到多张合适的 GPU 且当时有足够的空闲显存与内存时，每张卡处理独立的素材。资源不足时回退到单卡顺序生成。单个素材使用一张卡，所有生成进程随此次调用结束。
 
+批量调度会核对 CUDA 和 NVIDIA 设备报告的逐卡剩余显存。并发中遇到内存压力时，已完成的文件会保留，失败项会在其他任务结束后以原参数单卡重试一次。
+
 已在推理 Python 中的应用可直接使用 `Flash.tone_list()`、`Flash.tone_info()` 和 `Flash.play()`。同一个 `with Flash()` 适合连续生成并复用模型。运行限制、模型列表、基准和 Python 示例见[引擎说明](engine/README.md)。
 
 ## 许可

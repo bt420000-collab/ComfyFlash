@@ -14,6 +14,7 @@ from __future__ import annotations
 import contextlib
 import io as _io
 import json
+import logging
 import random
 import threading
 import time
@@ -396,9 +397,18 @@ class Flash:
                                 meta["runtime"] = rt.video_acceleration()
                 except Exception as exc:  # 运行时失败：保留可定位的诊断信息
                     detail = (buf_err.getvalue() or "") + (buf_out.getvalue() or "")
-                    return self._fail(
-                        tone, seed_value, exc, detail, started, "RUNTIME_ERROR"
-                    )
+                    oom = self._rt is not None and self._rt.is_oom(exc)
+                    result = self._fail(tone, seed_value, exc, detail, started, "OOM" if oom else "RUNTIME_ERROR")
+                    if result["error"]["code"] == "OOM" and self._rt is not None:
+                        exc.__traceback__ = None
+                        try:
+                            self._rt.hard_reset()
+                        except Exception:
+                            logging.getLogger(__name__).warning("Error unloading models after OOM", exc_info=True)
+                        finally:
+                            self._cache.clear()
+                            self._tick.clear()
+                    return result
 
             result = {
                 "ok": True,
@@ -430,7 +440,7 @@ class Flash:
     def _fail(self, tone, seed, exc, detail, started, code):
         message = str(exc)
         err = {"code": code, "message": message}
-        if "out of memory" in message.lower():
+        if code == "OOM" or "out of memory" in message.lower():
             err["code"] = "OOM"
             err["hint"] = (
                 "显存不足。可缩小 resolution，视频可缩短 duration。"

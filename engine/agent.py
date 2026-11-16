@@ -300,15 +300,30 @@ def device_mask(index, inherited):
     return tokens[index].strip()
 
 
-def render_requests(config, requests):
+def render_requests(config, requests, report=None):
     with Flash(config=config) as flash:
         results = []
-        for request in requests:
+        for position, request in enumerate(requests):
             try:
-                results.append(flash.play(**request))
+                result = flash.play(**request)
             except TypeError as exc:
-                results.append({"ok": False, "error": {"code": "BAD_REQUEST", "message": str(exc)}})
+                result = {"ok": False, "error": {"code": "BAD_REQUEST", "message": str(exc)}}
+            results.append(result)
+            if report:
+                report(position, result)
         return results
+
+
+def report_worker_result(position, result):
+    print(json.dumps({"position": position, "result": result}, ensure_ascii=False), flush=True)
+
+
+def worker_memory_error(message):
+    message = message.lower()
+    return any(word in message for word in (
+        "out of memory", "cudaerrormemoryallocation",
+        "hostbuffer.read_file_slice failed", "hostbuffer.truncate failed",
+    ))
 
 
 def worker_results(args, requests, index):
@@ -318,17 +333,33 @@ def worker_results(args, requests, index):
     command = [sys.executable, "-B", str(ENTRY), "play", "--config", str(args.config), "--worker"]
     for path in paths:
         command.extend(("--request", path))
-    run = None
+    results = []
     try:
         run = subprocess.run(command, env=environment, capture_output=True, encoding="utf-8", errors="replace")
-        results = json.loads(run.stdout)["results"]
-        if len(results) != len(requests):
-            raise ValueError("生成子进程返回的数量与请求不一致")
-    except (OSError, KeyError, ValueError, TypeError) as exc:
-        detail = run.stderr.strip().splitlines()[-1] if run and run.stderr.strip() else str(exc)
-        results = [{"ok": False, "error": {"code": "WORKER_ERROR", "message": detail}} for _ in paths]
+        for line in run.stdout.splitlines():
+            try:
+                report = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(report, dict) or report.get("position") != len(results):
+                continue
+            item = report.get("result")
+            if isinstance(item, dict) and isinstance(item.get("ok"), bool) and len(results) < len(paths):
+                results.append(item)
+        diagnostics = (run.stderr + "\n" + run.stdout).strip().splitlines()
+        memory_error = next((line for line in diagnostics if worker_memory_error(line)), None)
+        failure = memory_error or (diagnostics[-1] if diagnostics else f"进程退出码 {run.returncode}")
+        error_code = "WORKER_MEMORY_ERROR" if memory_error else "WORKER_ERROR"
+    except OSError as exc:
+        failure, error_code = str(exc), "WORKER_ERROR"
+    results.extend({"ok": False, "error": {"code": error_code, "message": failure}} for _ in paths[len(results):])
     return [(position, {**result, "device": f"cuda:{index}"})
             for (position, _), result in zip(requests, results)]
+
+
+def most_free_device(hardware):
+    usable = (gpu for gpu in hardware["gpus"] if gpu["ready"])
+    return max(usable, key=lambda gpu: (gpu["free_mib"], gpu["total_mib"]), default=None)
 
 
 def batch_result(results, devices):
@@ -340,7 +371,7 @@ def play(args):
     paths = args.request if isinstance(args.request, list) else [args.request]
     requests = [read_json(path.expanduser()) for path in paths]
     if getattr(args, "worker", False):
-        return batch_result(render_requests(args.config, requests), [])
+        return batch_result(render_requests(args.config, requests, report_worker_result), [])
     if len(requests) == 1:
         device = load_config(args.config).get("device", "cuda:0")
         inherited = os.getenv("CUDA_VISIBLE_DEVICES")
@@ -357,17 +388,33 @@ def play(args):
     hardware = hardware_report(probe_python(sys.executable, hardware_only=True), preferred)
     devices = hardware["active_devices"]
     if len(devices) < 2:
-        candidates = [gpu for gpu in hardware["gpus"] if gpu["ready"]]
-        if not candidates:
+        best = most_free_device(hardware)
+        if best is None:
             raise ValueError(hardware["summary"])
-        devices = [max(candidates, key=lambda gpu: (gpu["free_mib"], gpu["total_mib"]))["index"]]
+        devices = [best["index"]]
     devices = devices[:len(requests)]
     indexed = list(enumerate(paths))
     with ThreadPoolExecutor(max_workers=len(devices)) as executor:
         workers = [executor.submit(worker_results, args, indexed[slot::len(devices)], index)
                    for slot, index in enumerate(devices)]
-        finished = sorted(item for worker in workers for item in worker.result())
-    return batch_result([result for _, result in finished], devices)
+        finished = dict(item for worker in workers for item in worker.result())
+    serial_retries = 0
+    if len(devices) > 1:
+        retry = []
+        for position, output in finished.items():
+            error = output.get("error", {})
+            if error.get("code") in {"OOM", "WORKER_MEMORY_ERROR"} or worker_memory_error(error.get("message", "")):
+                retry.append((position, paths[position]))
+        if retry:
+            refreshed = hardware_report(probe_python(sys.executable, hardware_only=True), preferred)
+            available = most_free_device(refreshed)
+            if available is not None:
+                finished.update(worker_results(args, sorted(retry), available["index"]))
+                serial_retries = len(retry)
+    result = batch_result([finished[position] for position in range(len(paths))], devices)
+    if serial_retries:
+        result["serial_retries"] = serial_retries
+    return result
 
 
 def main():
@@ -397,7 +444,8 @@ def main():
         result = args.handler(args)
     except (OSError, ValueError, TypeError, subprocess.SubprocessError) as exc:
         result = {"ok": False, "code": "SETUP_OR_REQUEST_ERROR", "message": str(exc)}
-    print(json_text(result), end="")
+    if not getattr(args, "worker", False) or result.get("code") == "SETUP_OR_REQUEST_ERROR":
+        print(json_text(result), end="")
     return 0 if result["ok"] else 1
 
 
