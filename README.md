@@ -1,85 +1,91 @@
 # ComfyFlash
 
-**ComfyUI 是音色实验室，ComfyFlash 是给 Agent 演奏的 AI 推理电子琴。** ⚡
+**面向 AI Agent 的轻量化、模块化本地推理引擎。**
 
-在 ComfyUI 里探索模型、LoRA、节点组合与最佳参数；验证成熟后，将它们固化为 ComfyFlash 的 **Bank / Tone**。Agent 只要查看音色表、选择音色、调节通用旋钮、接入素材，就能直接 Play。**不需要画工作流，不启动 Web UI，不挂后台端口。**
+把验证成熟的模型推理方案封装成**可发现、可直接调用的独立功能**。Agent 不必搭建节点工作流，也不用启动网页或后台服务；只需查看可用功能、提供输入参数，就能在本地执行生成任务。
 
-**ComfyFlash 是通用的生产型推理架构，不是 H3 专用软件。** 当前 v0.1 以 **H3 / Pika 作为第一批实验和验证音色**，用来验证电子琴的设计能不能工作。以后可以装进别的图像、视频、音频乃至其他推理能力，无须把 Engine 改造成一张越来越大的工作流。
+- **直接调用**：Python 函数或命令行执行，不启动 HTTP/WebSocket 服务。
+- **按需扩展**：每个功能模块独立声明用途、输入、支持的参数和依赖；Agent 可自动发现。
+- **统一接口**：图像、音频等输入输出及分辨率、时长、随机种子等常用参数由引擎统一处理。
+- **复用资源**：共享现有模型权重，按需加载；同一 Python 进程可复用已加载的模型。
+- **只负责推理**：镜头安排、素材组合、批量生产等业务规划交给 Agent，而不是固化成复杂工作流。
 
-*ComfyFlash is an agent-native inference instrument. ComfyUI is the lab for designing and testing sounds; ComfyFlash turns verified inference recipes into playable tones. H3/Pika is the first bank used to validate this architecture, not a permanent feature limit. No workflow UI or background inference server is required.*
+*ComfyFlash is a lightweight, modular local inference engine for AI agents. It exposes discoverable capabilities through a consistent Python interface, without a workflow editor or background API server. H3/Pika is the first supported model family, not a permanent product limitation.*
 
-## 电子琴架构：琴身不变，音色自由增长
-
-| 电子琴 | ComfyFlash | 谁负责什么 |
-|---|---|---|
-| **Engine（机芯）** | 通用推理运行时 | 模型加载、显存管理、执行、缓存与输出 |
-| **Bank（音色库）** | `engine/bank/` | 收藏可独立调用的成品推理能力 |
-| **Tone（音色）** | `t1`、`t2`、`t3`… | 各自的模型配方、推理算法及专属条件，不包办完整项目流程 |
-| **Controls（旋钮）** | 标准生成参数 | 分辨率、时长、随机或固定种子等共用控制 |
-| **Interface（插口）** | 标准输入输出 | Text In、Image In、预留 Audio In、File Out |
-| **Player（演奏者）** | Agent | 发现音色、选择工具、组织任务、决定输出 |
+## 工作原理
 
 ```text
-             Agent（演奏者）
-                    │
-         tone_list / tone_info
-                    │
-             Flash.play(...)
-                    │
-         ┌──────────┼──────────┐
-         │          │          │
-     Interface   Controls    Bank / Tone
-      标准插口     通用旋钮     成品音色
-         └──────────┼──────────┘
-                    │
-                 Engine
-                    │
-           共享/本地模型权重
-                    │
-            调用者的输出路径
+             AI Agent
+                │
+       查询功能与参数说明
+     tone_list / tone_info
+                │
+      发起一次推理调用
+           Flash.play
+                │
+     ┌──────────┼───────────┐
+     │          │           │
+ 标准输入输出  通用参数    功能模块库
+   文件/素材  尺寸/种子   t1 / t2 / ...
+     └──────────┼───────────┘
+                │
+          本地推理核心
+      模型加载 / 显存 / 解码
+                │
+       输出到调用者指定路径
 ```
 
-**这不是「把 ComfyUI 工作流换成 Python 的壳」。** Tone 不执行 ComfyUI 工作流 JSON，而是调用真正的模型推理代码。Engine 管公共旋钮和接口，不让每个 Tone 反复实现同一套分辨率、种子、文件处理。Agent 不必阅读每个工作流，也不必手动学习每种模型的繁琐节点操作。
+| 组成 | 作用 |
+|---|---|
+| **推理核心（Engine）** | 管理模型加载、显存、执行及文件输出 |
+| **功能模块库（Bank）** | 保存已经验证、可独立调用的推理功能 |
+| **功能模块（Tone）** | 定义具体模型、推理配方和所需输入 |
+| **通用参数（Controls）** | 统一管理分辨率、时长、随机/固定种子等参数 |
+| **输入输出（Interface）** | 提供一致的文本、图像等输入及文件输出方式 |
+| **AI Agent** | 发现功能、选择工具、决定如何组合和使用 |
 
-**加音色不换对外接口。** 同类模型的新配方可加入 Bank，声明输入和支持的旋钮，由 `tone_list()` 自动展示；不同底层架构的模型未来可能还需新增推理适配模块，但 Agent 仍只学习同一套 `tone_list()`、`tone_info()`、`play()`。一个 Tone 做一件事；多 Tone 的业务编排交给 Agent，而不是塞进某个「万能工作流」。
+**模块只负责自身的推理能力。** 通用参数和文件处理不必在每个模块里重复实现；任务如何拆分、组合哪些功能由 Agent 决定。增加新功能时，在模块库内声明接口和实现，Agent 就能通过相同的调用方式使用它。不同模型架构可能需要新增底层适配代码，但对外接口不必随之变化。
 
-### 首批已实现音色：H3 / Pika
+> 内部沿用 `Bank / Tone / Controls / Interface` 等命名，设计灵感来自电子琴的功能组织方式。这里的 `Tone` 指**独立推理功能**，不是音频音色，也不意味着项目只能处理音乐。
 
-| Tone | 名称 | 输入 | 输出 |
+## 当前已实现：H3 / Pika（v0.1）
+
+H3/Pika 是第一版用于验证上述设计的模型组合，**不是 ComfyFlash 的长期功能上限**。当前提供四个可直接调用的功能：
+
+| 编号 | 功能 | 必需输入 | 输出 |
 |---|---|---|---|
-| `t1` | Pika 文生视频 | prompt | 含模型同期声的视频 |
-| `t2` | Pika 参考生视频 | prompt + 一张 image_in | 含模型同期声的视频 |
-| `t3` | H3 文生图 | prompt | 图片 |
-| `t4` | H3 图片编辑 | prompt + 一张 image_in | 图片 |
+| `t1` | Pika 文生视频 | 提示词 | 含模型同期声的视频 |
+| `t2` | Pika 参考生视频 | 提示词、单张参考图 | 含模型同期声的视频 |
+| `t3` | H3 文生图 | 提示词 | 图片 |
+| `t4` | H3 图片编辑 | 提示词、待编辑图 | 图片 |
 
-这四个 Tone 是**首版样机的音色**，不代表未来只能支持四项功能或只能使用 H3。v0.1 使用本地 ComfyUI Python 环境及现有权重，视频基于 Pika Flex LoRA。当前 `audio_in` 是预留接口，四个 Tone 均未实现外部音频输入，视频同期声由模型自身生成。
+当前视频基于 Pika Flex LoRA，使用本地已有的 H3/Pika 模型与 ComfyUI Python 推理环境。**不要求 ComfyUI 后台运行**，但仍直接依赖其中的 `comfy.*` 推理模块；它并非完全独立于 ComfyUI 安装。视频同期声由模型自身生成；`audio_in` 目前只是预留输入接口，四个功能均不支持外部音频输入。
 
-### Agent 只需三个统一动作
+### 三个统一调用方法
 
 ```python
 from engine import Flash
 
 with Flash() as flash:
-    flash.tone_list()       # 认识这台琴目前有什么音色
-    flash.tone_info("t2")   # 查看该音色支持的插口和旋钮
-    flash.play(
+    flash.tone_list()        # 列出可用功能
+    flash.tone_info("t2")    # 查看功能说明、输入要求和参数
+
+    result = flash.play(
         "t2",
         prompt="<Picture 1> 里的女孩转身微笑",
         image_in=["D:/MV/character.png"],
         resolution="768x448",
         duration=1.6,
-        seed=1234,          # None = 随机种子
-        output="D:/MV/shot01.mp4",
+        seed=1234,            # None = 随机种子
+        output="D:/MV/shot01.mp4"
     )
 ```
 
-ComfyFlash 没有自己的 `out/` 目录，作品输出到调用者指定的位置。默认安静运行，不把大段进度日志塞入 Agent 上下文；同一 Python 会话内可复用模型。**无服务不等于无依赖**：现阶段仍直接复用已安装 ComfyUI 的 `comfy.*` 推理模块，只是不需要 ComfyUI 的网页、服务器、任务队列或工作流执行器。**当前内部实现仍围绕 H3 设计；「通用电子琴」是明确的架构方向，不代表 v0.1 已能直接加载任意模型。**
+不需要额外的输出目录：生成文件直接写入调用者指定的绝对路径。默认尽量减少日志输出，避免无关推理信息占用 Agent 上下文；同一 Python 会话支持模型复用。与完整 ComfyUI 工作流 JSON 不同，当前功能模块直接调用模型推理代码，不启动可视化节点执行器。
 
-更具体的兼容性、参数范围、采样配方、性能基准见 [引擎说明](engine/README.md)。
+模型依赖、运行限制、性能基准与更完整的参数说明见 [引擎说明](engine/README.md)。
 
 ---
-
-
 
 ## 交给 Agent
 
@@ -133,13 +139,6 @@ python -B engine/agent.py register --comfyui-root "D:/ComfyUI/ComfyUI" --models-
   "output": "D:/MyProject/shot01.mp4"
 }
 ```
-
-| 功能 | 输入 | 输出 |
-|---|---|---|
-| t1 文生视频 | 提示词 | 带声视频 |
-| t2 参考生视频 | 提示词和一张参考图 | 带声视频 |
-| t3 文生图 | 提示词 | 图片 |
-| t4 图片编辑 | 提示词和一张待编辑图 | 图片 |
 
 批量生成时，在同一次 `play` 命令中重复传入 `--request`，每个请求使用独立的输出路径。检测到多张合适的 GPU 且当时有足够的空闲显存与内存时，每张卡处理独立的素材。资源不足时回退到单卡顺序生成。单个素材使用一张卡，所有生成进程随此次调用结束。
 
