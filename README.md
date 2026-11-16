@@ -1,5 +1,7 @@
 # ComfyFlash
 
+![ComfyFlash 宣传概念图，展示 Agent 调用本地 H3/Pika 引擎生成图片和视频](docs/assets/comfyflash-home-hero.png)
+
 **面向 AI Agent 的轻量化、模块化本地推理引擎。**
 
 把验证成熟的模型推理方案封装成**可发现、可直接调用的独立功能**。Agent 不必搭建节点工作流，也不用启动网页或后台服务；只需查看可用功能、提供输入参数，就能在本地执行生成任务。
