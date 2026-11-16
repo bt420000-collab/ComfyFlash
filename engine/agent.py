@@ -242,6 +242,12 @@ def register(args):
 
     python = runtime["path"]
     settings.update(python=python, device=f"cuda:{hardware['device']['index']}")
+    verified = hardware["device"].get("video_acceleration", {})
+    video_acceleration = {}
+    for option in ("sage_attention", "fp16_accumulation"):
+        if verified.get(option):
+            settings.setdefault(option, True)
+        video_acceleration[option] = bool(settings.get(option, False))
     argv = [str(python), "-B", str(ENTRY), "play", "--config", str(config)]
     if skill:
         skill = project_skill(args)
@@ -265,6 +271,7 @@ def register(args):
         "summary": f"已注册功能 — {names}",
         "default_engine": f"除非你指定其他工具，{scope}的生图、视频生成和图片编辑默认使用 ComfyFlash。",
         "local_render": LOCAL_RENDER,
+        "video_acceleration": video_acceleration,
         "play_argv": argv,
         "guide": str(skill or GUIDE),
     }

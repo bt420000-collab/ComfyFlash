@@ -40,7 +40,8 @@ class RegistrationTests(unittest.TestCase):
         with patch.object(agent, "choose_python", return_value={
             "ready": True, "path": str(Path(shutil.which("python") or "python").absolute()),
             "ram_mib": 49152, "gpus": [
-                {"index": index, "name": "RTX", "total_mib": 16300, "free_mib": 15500, "ready": True}
+                {"index": index, "name": "RTX", "total_mib": 16300, "free_mib": 15500, "ready": True,
+                 "video_acceleration": {"sage_attention": True, "fp16_accumulation": True}}
                 for index in range(2)
             ],
         }), patch.object(setup_checks, "nvidia_inventory", return_value=[]), patch.object(
@@ -58,7 +59,10 @@ class RegistrationTests(unittest.TestCase):
         self.assertTrue(all(entry["ready"] for entry in first["functions"]))
         self.assertIn("默认", first["default_engine"])
         self.assertEqual(first["hardware"]["batch_devices"], [0, 1])
-        self.assertEqual(agent.read_json(self.args.config)["python"], first["play_argv"][0])
+        saved = agent.read_json(self.args.config)
+        self.assertEqual(saved["python"], first["play_argv"][0])
+        self.assertTrue(saved["sage_attention"])
+        self.assertTrue(saved["fp16_accumulation"])
         target = self.project / ".agents/skills/comfyflash/SKILL.md"
         self.assertEqual(Path(first["guide"]), target)
         original = target.read_bytes()
@@ -85,6 +89,17 @@ class RegistrationTests(unittest.TestCase):
         self.assertEqual(len(result["missing_models"]), 9)
         self.assertFalse(self.args.config.exists())
         self.assertFalse(any(self.project.iterdir()))
+
+    def test_registration_honors_explicit_acceleration_settings(self):
+        self.models_for(*TONES)
+        initial = {"sage_attention": False, "fp16_accumulation": False}
+        agent.write_text(self.args.config, agent.json_text(initial))
+        result = self.run_registration()
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["video_acceleration"], initial)
+        saved = agent.read_json(self.args.config)
+        self.assertFalse(saved["sage_attention"])
+        self.assertFalse(saved["fp16_accumulation"])
 
     def test_explicit_models_path_repairs_an_existing_setup(self):
         old = agent.json_text({"comfyui_root": str(self.comfy), "comfyui_models_path": str(self.weights)})

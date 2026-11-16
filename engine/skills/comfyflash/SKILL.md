@@ -11,4 +11,6 @@ Use the installed project's call configuration below, or the `play_argv` reporte
 
 For independent outputs, pass one `--request` per JSON file in the same command. Give each output a distinct absolute path. ComfyFlash uses separate available GPUs when the hardware and current resource checks allow it. Run dependent requests in order.
 
+Large video requests can take several minutes on a single GPU. Use an execution session you can poll when the client times out before generation finishes. Preserve the requested canvas and duration, and use the returned `sampling`, `runtime`, and `timing_s` fields when reporting performance.
+
 Wait for the command to finish. Return the actual file and report any structured error if generation fails. Use the registration result to check readiness and missing weight paths. When a registration path has moved, ask for the current ComfyFlash directory or re-register from its known new location.

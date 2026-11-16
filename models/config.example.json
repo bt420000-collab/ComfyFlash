@@ -3,7 +3,5 @@
   "comfyui_models_path": "D:/ComfyUI/ComfyUI/models",
   "device": "cuda:0",
   "dynamic_vram": true,
-  "vram_headroom_gb": 0.1,
-  "sage_attention": false,
-  "fp16_accumulation": false
+  "vram_headroom_gb": 0.1
 }

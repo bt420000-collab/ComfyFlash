@@ -171,6 +171,15 @@ class Runtime:
             self._mods[name] = mod
         return mod
 
+    def video_acceleration(self):
+        attention = getattr(self._mod("comfy.ldm.modules.attention"), "optimized_attention", None)
+        matmul = getattr(self.torch.backends.cuda, "matmul", None)
+        return {
+            "dynamic_vram": self.dynamic_vram,
+            "attention_default": getattr(attention, "__name__", None),
+            "fp16_accumulation": bool(getattr(matmul, "allow_fp16_accumulation", False)),
+        }
+
     @property
     def torch(self):
         return self._mod("torch")

@@ -111,6 +111,16 @@ class _Run:
         self.image_paths = req["images"]
         self.params = req["advanced"]
         self.meta: dict = {}
+        self.video = spec["output"] == "video"
+
+    @contextlib.contextmanager
+    def timed_video_stage(self, name):
+        if not self.video:
+            yield
+            return
+        started = time.perf_counter()
+        yield
+        self.meta.setdefault("timing_s", {})[name] = round(time.perf_counter() - started, 2)
 
     # ---- 模型
     def _path(self, key: str) -> str:
@@ -143,16 +153,19 @@ class _Run:
         )
 
     def condition(self, build, *args, **kwargs):
-        with self.rt.stage():
+        with self.timed_video_stage("conditioning"), self.rt.stage():
             return build(self.rt, *args, **kwargs)
 
     # ---- 采样
     def sample(self, model, cond, latent):
         p = self.params
+        if self.video:
+            self.meta["sampling"] = {key: p[key] for key in ("steps", "sampler", "scheduler", "cfg", "lora_strength")}
+            self.meta["sampling"]["lora"] = self.spec["models"]["lora"] if p["lora_strength"] else None
         noise = self.rt.prepare_noise(latent["samples"], self.seed)
         sigmas = h3.PIKA_SIGMAS if p["scheduler"] == "pika" else None
         negative = None if sigmas is not None and p["cfg"] == 1.0 else h3.zero_out(cond)
-        with self.rt.stage():
+        with self.timed_video_stage("sampling"), self.rt.stage():
             out = self.rt.sample_latent(
                 model,
                 cond,
@@ -177,9 +190,9 @@ class _Run:
         self._offloaded = True
 
     def decode_frames(self, vae, samples):
-        if self.spec.get("output") == "video":
+        if self.video:
             self._offload_for_decode()
-        with self.rt.stage():
+        with self.timed_video_stage("video_decode"), self.rt.stage():
             frames = self.rt.decode(vae, samples["samples"])
         if frames.dim() == 5:
             frames = frames.reshape(-1, frames.shape[-3], frames.shape[-2], frames.shape[-1])
@@ -188,15 +201,16 @@ class _Run:
         return frames
 
     def decode_audio(self, vae_audio, samples):
-        if self.spec.get("output") == "video":
+        if self.video:
             self._offload_for_decode()
-        with self.rt.stage():
+        with self.timed_video_stage("audio_decode"), self.rt.stage():
             return self.rt.decode_audio(vae_audio, samples["samples"])
 
     def save_video(self, frames, audio=None):
         if frames.dim() == 4 and frames.shape[0] == 1 and self.frames == 1:
             raise ParamError("BAD_OUTPUT", "t1/t2 产出的帧数异常（只有 1 帧），请检查模型")
-        path = media.save_video(frames, self.output, fps=h3.FPS, audio=audio)
+        with self.timed_video_stage("encoding"):
+            path = media.save_video(frames, self.output, fps=h3.FPS, audio=audio)
         self.meta.update({
             "width": int(frames.shape[2]),
             "height": int(frames.shape[1]),
@@ -378,6 +392,8 @@ class Flash:
                             run = _Run(self, spec, req)
                             path = TONES[tone].play(run)
                             meta = dict(run.meta)
+                            if run.video:
+                                meta["runtime"] = rt.video_acceleration()
                 except Exception as exc:  # 运行时失败：保留可定位的诊断信息
                     detail = (buf_err.getvalue() or "") + (buf_out.getvalue() or "")
                     return self._fail(

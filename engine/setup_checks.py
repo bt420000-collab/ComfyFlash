@@ -62,6 +62,30 @@ import importlib
 import json
 import sys
 
+def probe_video_acceleration(torch, gpu):
+    verified = {"sage_attention": False, "fp16_accumulation": False}
+    with torch.inference_mode():
+        try:
+            from sageattention import sageattn
+            q = torch.ones((1, 1, 128, 128), device="cuda", dtype=torch.bfloat16)
+            output = sageattn(q, q, q, tensor_layout="HND", smooth_k=False)
+            verified["sage_attention"] = bool(torch.isfinite(output).all().item())
+        except Exception as exc:
+            gpu["sage_attention_error"] = f"{type(exc).__name__}: {exc}"
+
+        matmul = torch.backends.cuda.matmul
+        previous = getattr(matmul, "allow_fp16_accumulation", None)
+        if previous is not None:
+            try:
+                matmul.allow_fp16_accumulation = True
+                matrix = torch.ones((128, 128), device="cuda", dtype=torch.float16)
+                verified["fp16_accumulation"] = bool(torch.isfinite(matrix @ matrix).all().item())
+            except (AttributeError, RuntimeError) as exc:
+                gpu["fp16_accumulation_error"] = f"{type(exc).__name__}: {exc}"
+            finally:
+                matmul.allow_fp16_accumulation = previous
+    return verified
+
 root, *deps = sys.argv[1:]
 report = {"ready": False, "version": sys.version.split()[0], "missing": [], "errors": [], "gpus": []}
 if root:
@@ -95,7 +119,9 @@ with contextlib.redirect_stdout(sys.stderr):
                                free_mib=free // 2**20)
                     value = torch.ones(2, device="cuda", dtype=torch.bfloat16)
                     (value + value).sum().item()
-                gpu["ready"] = True
+                    gpu["ready"] = True
+                    if root and torch.cuda.get_device_capability(index)[0] >= 8:
+                        gpu["video_acceleration"] = probe_video_acceleration(torch, gpu)
             except Exception as exc:
                 gpu["error"] = str(exc)
     if root and any(gpu["ready"] for gpu in report["gpus"]) and not (report["missing"] or report["errors"]):

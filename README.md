@@ -122,6 +122,8 @@ python -B engine/agent.py register --comfyui-root "D:/ComfyUI/ComfyUI" --models-
 
 额外模型目录可参照 [models/config.example.json](models/config.example.json)。用 `--python` 指定推理解释器，也可用同一组路径参数纠正本地配置。注册检查对应版本的权重尺寸和 safetensors 头部、Python 依赖能否导入、ComfyUI 是否有 H3 图像和视频支持，以及 CUDA 能否执行测试运算。它会报告每张可见显卡的总显存与剩余显存、系统内存和并发条件。
 
+注册时会试跑已安装的 SageAttention 和 FP16 累加。测试通过的选项会写入配置，已有的显式设置优先。视频结果会回报实际采样步数、LoRA、默认注意力后端和各阶段耗时。切换精度或注意力后端可能改变同种子的画面。
+
 缺权重时，报告提供文件、目标路径、下载总量和上游来源。Agent 在你确认后，使用报告的 `download_argv` 并追加 `--yes` 下载。下载只使用列出的上游文件，校验 SHA-256 后再写入目标路径。缺 Python 环境时，先确认再按官方方式安装或修复 ComfyUI 和 CUDA 版 PyTorch，完成后重新注册。模型许可见上游说明。[ComfyUI 安装指南](https://docs.comfy.org/installation) · [H3 视频权重](https://huggingface.co/Comfy-Org/MiniMax-H3) · [H3 图像权重](https://huggingface.co/Comfy-Org/MiniMax-H3-Image)
 
 本项目用 16 GiB 级 NVIDIA 显卡验证四项功能，注册报告以 32 GiB 系统内存作为建议值。其他配置可参考检查结果试跑较小画布或较短视频。具体上限取决于任务规格与当时的可用内存。[引擎实测记录](engine/README.md#6-实测记录)
