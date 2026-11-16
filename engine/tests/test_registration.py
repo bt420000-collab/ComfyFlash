@@ -1,4 +1,6 @@
 import argparse
+import hashlib
+import io
 import shutil
 import subprocess
 from pathlib import Path
@@ -6,7 +8,7 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
-from engine import agent
+from engine import agent, setup_checks
 from engine.bank import TONES
 from engine.core import _MODEL_KINDS
 
@@ -35,17 +37,28 @@ class RegistrationTests(unittest.TestCase):
                 path.touch()
 
     def run_registration(self):
-        with patch.object(agent, "LIBRARIES", ("json",)):
+        with patch.object(agent, "choose_python", return_value={
+            "ready": True, "path": str(Path(shutil.which("python") or "python").absolute()),
+            "ram_mib": 49152, "gpus": [
+                {"index": index, "name": "RTX", "total_mib": 16300, "free_mib": 15500, "ready": True}
+                for index in range(2)
+            ],
+        }), patch.object(setup_checks, "nvidia_inventory", return_value=[]), patch.object(
+            agent, "model_issue", side_effect=lambda path, artifact: None if path.is_file() else "missing"
+        ):
             result = agent.register(self.args)
-        self.args.comfyui_root = self.args.models_path = None
+        if self.args.config.is_file():
+            self.args.comfyui_root = self.args.models_path = None
         return result
 
     def test_project_registration_reports_real_model_readiness_and_is_idempotent(self):
-        self.models_for("t3")
+        self.models_for(*TONES)
         first = self.run_registration()
         self.assertTrue(first["ok"])
-        self.assertEqual([entry["tone"] for entry in first["functions"] if entry["ready"]], ["t3", "t4"])
-        self.assertEqual([entry["tone"] for entry in first["functions"] if entry["missing"]], ["t1", "t2"])
+        self.assertTrue(all(entry["ready"] for entry in first["functions"]))
+        self.assertIn("默认", first["default_engine"])
+        self.assertEqual(first["hardware"]["batch_devices"], [0, 1])
+        self.assertEqual(agent.read_json(self.args.config)["python"], first["play_argv"][0])
         target = self.project / ".agents/skills/comfyflash/SKILL.md"
         self.assertEqual(Path(first["guide"]), target)
         original = target.read_bytes()
@@ -68,21 +81,26 @@ class RegistrationTests(unittest.TestCase):
         result = self.run_registration()
         self.assertEqual(result["code"], "MISSING_MODELS")
         self.assertFalse(result["ok"])
+        self.assertTrue(result["needs_download_confirmation"])
+        self.assertEqual(len(result["missing_models"]), 9)
+        self.assertFalse(self.args.config.exists())
         self.assertFalse(any(self.project.iterdir()))
 
     def test_explicit_models_path_repairs_an_existing_setup(self):
+        old = agent.json_text({"comfyui_root": str(self.comfy), "comfyui_models_path": str(self.weights)})
+        self.args.config.write_text(old, encoding="utf-8")
         first = self.run_registration()
         self.assertFalse(first["ok"])
-        self.models_for("t3")
-        corrected = self.root / "corrected-models"
-        self.weights.rename(corrected)
-        self.args.models_path = str(corrected)
+        self.assertEqual(self.args.config.read_text(encoding="utf-8"), old)
+        self.weights = self.root / "corrected-models"
+        self.models_for(*TONES)
+        self.args.models_path = str(self.weights)
         self.assertTrue(self.run_registration()["ok"])
 
     @unittest.skipUnless(shutil.which("git"), "Git is unavailable")
     def test_project_registration_keeps_local_paths_out_of_git(self):
         subprocess.run(["git", "init", "-q", str(self.project)], check=True, capture_output=True)
-        self.models_for("t3")
+        self.models_for(*TONES)
         self.run_registration()
         target = ".agents/skills/comfyflash/SKILL.md"
         check = subprocess.run(["git", "-C", str(self.project), "check-ignore", "--", target],
@@ -100,13 +118,57 @@ class RegistrationTests(unittest.TestCase):
         self.assertFalse(self.args.config.exists())
 
     def test_play_reads_request_and_returns_native_validation_error(self):
-        self.args.config = agent.configure(self.args)
+        self.models_for(*TONES)
+        self.run_registration()
         request = self.root / "请求.json"
         request.write_text(
             '{"tone":"t2","prompt":"测试","output":"sample.mp4"}', encoding="utf-8-sig"
         )
         result = agent.play(argparse.Namespace(config=self.args.config, request=request))
         self.assertEqual(result["error"]["code"], "MISSING_INPUT")
+
+    def test_cuda_mask_preserves_logical_device_order(self):
+        self.assertEqual(agent.device_mask(1, "GPU-a, GPU-b"), "GPU-b")
+        self.assertEqual(agent.device_mask(2, None), "2")
+        with self.assertRaises(ValueError):
+            agent.device_mask(2, "1,0")
+
+    def test_structurally_bad_weight_is_detected(self):
+        path = self.weights / "weight.safetensors"
+        self.weights.mkdir()
+        path.write_bytes(b"not tensors")
+        self.assertEqual(agent.model_issue(path, {"bytes": 11}), "invalid_header")
+
+    def test_download_requires_affirmative_consent(self):
+        self.args.yes = False
+        with patch.object(agent, "download_weight") as download:
+            with self.assertRaises(ValueError):
+                agent.download_models(self.args)
+            download.assert_not_called()
+        self.assertFalse(self.args.config.exists())
+
+    def test_download_rejects_bad_bytes_and_preserves_previous_file(self):
+        path = self.root / "weight.safetensors"
+        path.write_bytes(b"old")
+        header = b'{"tensor":{"dtype":"U8","shape":[1],"data_offsets":[0,1]}}'
+        weight = len(header).to_bytes(8, "little") + header + b"x"
+        entry = {"path": str(path), "url": "https://example.invalid/model",
+                 "bytes": len(weight), "sha256": hashlib.sha256(weight).hexdigest()}
+        with patch.object(setup_checks, "urlopen", return_value=io.BytesIO(weight[:-1] + b"y")):
+            with self.assertRaises(ValueError):
+                setup_checks.download_weight(entry)
+        self.assertEqual(path.read_bytes(), b"old")
+        self.assertFalse(list(self.root.glob("*.part")))
+        with patch.object(setup_checks, "urlopen", return_value=io.BytesIO(weight)):
+            self.assertTrue(setup_checks.download_weight(entry))
+        self.assertEqual(path.read_bytes(), weight)
+
+    def test_duplicate_batch_outputs_are_rejected_before_rendering(self):
+        request = self.root / "duplicate.json"
+        request.write_text(agent.json_text({"output": str(self.root / "out.png")}), encoding="utf-8")
+        args = argparse.Namespace(config=self.args.config, request=[request, request])
+        with self.assertRaisesRegex(ValueError, "不同的 output"):
+            agent.play(args)
 
 
 if __name__ == "__main__":

@@ -54,8 +54,11 @@ def load_config(path=None) -> dict:
     cfg_path = Path(path).expanduser() if path else DEFAULT_CONFIG
     if not cfg_path.is_file():
         raise FileNotFoundError("找不到模型配置：{}".format(cfg_path))
-    cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
+    return resolve_config(json.loads(cfg_path.read_text(encoding="utf-8-sig")), cfg_path)
 
+
+def resolve_config(settings, path=None) -> dict:
+    cfg = dict(settings)
     root = cfg.get("comfyui_root")
     if not root:
         raise ValueError("models/config.json 缺少 comfyui_root（ComfyUI 根目录）")
@@ -65,7 +68,7 @@ def load_config(path=None) -> dict:
         key: str(dirs.get(key) or Path(base) / key)
         for key in ("diffusion_models", "text_encoders", "vae", "loras")
     }
-    cfg["_path"] = str(cfg_path)
+    cfg["_path"] = str(path) if path else None
     return cfg
 
 
@@ -214,7 +217,7 @@ class Flash:
     """四个 Tone 的弹奏入口。同步、单进程、串行。"""
 
     def __init__(self, config=None, verbose: bool = False):
-        self._cfg = load_config(config)
+        self._cfg = resolve_config(config) if isinstance(config, dict) else load_config(config)
         self.verbose = bool(verbose)
         self._rt: Runtime | None = None
         self._cache: dict = {}
