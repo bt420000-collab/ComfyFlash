@@ -1,8 +1,91 @@
 # ComfyFlash
 
-在本地 ComfyUI Python 环境中运行 MiniMax H3 推理，视频使用 Pika Flex LoRA。支持文生视频、单图参考生视频、文生图和图片编辑。生成在调用者的本地 Python 中同步执行，视频含同期声。
+**面向 AI Agent 的轻量化、模块化本地推理引擎。**
 
-*ComfyFlash is a local Python runner for MiniMax H3 with Pika Flex LoRA for video. It uses an existing ComfyUI installation and weights. See the commands below to register the tool with a shell-capable agent or invoke it directly.*
+把验证成熟的模型推理方案封装成**可发现、可直接调用的独立功能**。Agent 不必搭建节点工作流，也不用启动网页或后台服务；只需查看可用功能、提供输入参数，就能在本地执行生成任务。
+
+- **直接调用**：Python 函数或命令行执行，不启动 HTTP/WebSocket 服务。
+- **按需扩展**：每个功能模块独立声明用途、输入、支持的参数和依赖；Agent 可自动发现。
+- **统一接口**：图像、音频等输入输出及分辨率、时长、随机种子等常用参数由引擎统一处理。
+- **复用资源**：共享现有模型权重，按需加载；同一 Python 进程可复用已加载的模型。
+- **只负责推理**：镜头安排、素材组合、批量生产等业务规划交给 Agent，而不是固化成复杂工作流。
+
+*ComfyFlash is a lightweight, modular local inference engine for AI agents. It exposes discoverable capabilities through a consistent Python interface, without a workflow editor or background API server. H3/Pika is the first supported model family, not a permanent product limitation.*
+
+## 工作原理
+
+```text
+             AI Agent
+                │
+       查询功能与参数说明
+     tone_list / tone_info
+                │
+      发起一次推理调用
+           Flash.play
+                │
+     ┌──────────┼───────────┐
+     │          │           │
+ 标准输入输出  通用参数    功能模块库
+   文件/素材  尺寸/种子   t1 / t2 / ...
+     └──────────┼───────────┘
+                │
+          本地推理核心
+      模型加载 / 显存 / 解码
+                │
+       输出到调用者指定路径
+```
+
+| 组成 | 作用 |
+|---|---|
+| **推理核心（Engine）** | 管理模型加载、显存、执行及文件输出 |
+| **功能模块库（Bank）** | 保存已经验证、可独立调用的推理功能 |
+| **功能模块（Tone）** | 定义具体模型、推理配方和所需输入 |
+| **通用参数（Controls）** | 统一管理分辨率、时长、随机/固定种子等参数 |
+| **输入输出（Interface）** | 提供一致的文本、图像等输入及文件输出方式 |
+| **AI Agent** | 发现功能、选择工具、决定如何组合和使用 |
+
+**模块只负责自身的推理能力。** 通用参数和文件处理不必在每个模块里重复实现；任务如何拆分、组合哪些功能由 Agent 决定。增加新功能时，在模块库内声明接口和实现，Agent 就能通过相同的调用方式使用它。不同模型架构可能需要新增底层适配代码，但对外接口不必随之变化。
+
+> 内部沿用 `Bank / Tone / Controls / Interface` 等命名，设计灵感来自电子琴的功能组织方式。这里的 `Tone` 指**独立推理功能**，不是音频音色，也不意味着项目只能处理音乐。
+
+## 当前已实现：H3 / Pika（v0.1）
+
+H3/Pika 是第一版用于验证上述设计的模型组合，**不是 ComfyFlash 的长期功能上限**。当前提供四个可直接调用的功能：
+
+| 编号 | 功能 | 必需输入 | 输出 |
+|---|---|---|---|
+| `t1` | Pika 文生视频 | 提示词 | 含模型同期声的视频 |
+| `t2` | Pika 参考生视频 | 提示词、单张参考图 | 含模型同期声的视频 |
+| `t3` | H3 文生图 | 提示词 | 图片 |
+| `t4` | H3 图片编辑 | 提示词、待编辑图 | 图片 |
+
+当前视频基于 Pika Flex LoRA，使用本地已有的 H3/Pika 模型与 ComfyUI Python 推理环境。**不要求 ComfyUI 后台运行**，但仍直接依赖其中的 `comfy.*` 推理模块；它并非完全独立于 ComfyUI 安装。视频同期声由模型自身生成；`audio_in` 目前只是预留输入接口，四个功能均不支持外部音频输入。
+
+### 三个统一调用方法
+
+```python
+from engine import Flash
+
+with Flash() as flash:
+    flash.tone_list()        # 列出可用功能
+    flash.tone_info("t2")    # 查看功能说明、输入要求和参数
+
+    result = flash.play(
+        "t2",
+        prompt="<Picture 1> 里的女孩转身微笑",
+        image_in=["D:/MV/character.png"],
+        resolution="768x448",
+        duration=1.6,
+        seed=1234,            # None = 随机种子
+        output="D:/MV/shot01.mp4"
+    )
+```
+
+不需要额外的输出目录：生成文件直接写入调用者指定的绝对路径。默认尽量减少日志输出，避免无关推理信息占用 Agent 上下文；同一 Python 会话支持模型复用。与完整 ComfyUI 工作流 JSON 不同，当前功能模块直接调用模型推理代码，不启动可视化节点执行器。
+
+模型依赖、运行限制、性能基准与更完整的参数说明见 [引擎说明](engine/README.md)。
+
+---
 
 ## 交给 Agent
 
@@ -56,13 +139,6 @@ python -B engine/agent.py register --comfyui-root "D:/ComfyUI/ComfyUI" --models-
   "output": "D:/MyProject/shot01.mp4"
 }
 ```
-
-| 功能 | 输入 | 输出 |
-|---|---|---|
-| t1 文生视频 | 提示词 | 带声视频 |
-| t2 参考生视频 | 提示词和一张参考图 | 带声视频 |
-| t3 文生图 | 提示词 | 图片 |
-| t4 图片编辑 | 提示词和一张待编辑图 | 图片 |
 
 批量生成时，在同一次 `play` 命令中重复传入 `--request`，每个请求使用独立的输出路径。检测到多张合适的 GPU 且当时有足够的空闲显存与内存时，每张卡处理独立的素材。资源不足时回退到单卡顺序生成。单个素材使用一张卡，所有生成进程随此次调用结束。
 
