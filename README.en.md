@@ -146,6 +146,8 @@ Successful configuration is saved in your local `models/config.json`. For additi
 
 The registration checks model file sizes and safetensors headers, Python import compatibility, H3 image/video support in the configured ComfyUI installation, and whether CUDA can execute a test operation. It reports available GPUs and per-device total/free VRAM, system memory, and potential concurrency constraints.
 
+Registration tests the installed SageAttention and FP16 accumulation on the local GPU. It enables options that pass and respects explicit configuration choices. Video results report the sampling steps, LoRA, default attention backend, and time spent in each stage. Changing the precision or attention backend can change the output for the same seed.
+
 If weights are missing, the report lists the needed files, target paths, total download size, and upstream sources. With your approval, the agent can use the reported `download_argv` with `--yes` to download them, checking SHA-256 before writing files. If the Python environment is missing, install or repair ComfyUI and CUDA-compatible PyTorch using the official instructions, then register again. Model licenses are governed by their respective upstream projects.
 
 References: [ComfyUI installation guide](https://docs.comfy.org/installation) · [H3 video weights](https://huggingface.co/Comfy-Org/MiniMax-H3) · [H3 image weights](https://huggingface.co/Comfy-Org/MiniMax-H3-Image)
