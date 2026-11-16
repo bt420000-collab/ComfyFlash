@@ -1,5 +1,7 @@
 # ComfyFlash
 
+**简体中文** | [English](README.en.md)
+
 ![ComfyFlash 宣传概念图，展示 Agent 调用本地 H3/Pika 引擎生成图片和视频](docs/assets/comfyflash-home-hero.png)
 
 **面向 AI Agent 的轻量化、模块化本地推理引擎。**
