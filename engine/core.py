@@ -275,6 +275,8 @@ class Flash:
                 vram_headroom_gb=cfg.get("vram_headroom_gb", 0.1),
                 sage_attention=cfg.get("sage_attention", False),
                 fp16_accumulation=cfg.get("fp16_accumulation", False),
+                disable_pinned_memory=cfg.get("disable_pinned_memory", False),
+                disable_comfy_compiler=cfg.get("disable_comfy_compiler", False),
             )
         return self._rt
 

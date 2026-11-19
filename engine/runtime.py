@@ -58,6 +58,7 @@ class Runtime:
         self, comfyui_root: str, device: str = "cuda:0", *,
         dynamic_vram: bool = True, vram_headroom_gb: float = 0.1,
         sage_attention: bool = False, fp16_accumulation: bool = False,
+        disable_pinned_memory: bool = False, disable_comfy_compiler: bool = False,
     ):
         _pin_device(device)
         self.root = _bind_path(comfyui_root)
@@ -66,9 +67,11 @@ class Runtime:
         self._tracker = None
         self.dynamic_vram = self._init_backend(
             dynamic_vram, vram_headroom_gb, sage_attention, fp16_accumulation,
+            disable_pinned_memory, disable_comfy_compiler,
         )
 
-    def _init_backend(self, dynamic_vram, headroom_gb, sage_attention, fp16_accumulation):
+    def _init_backend(self, dynamic_vram, headroom_gb, sage_attention, fp16_accumulation,
+                      disable_pinned_memory, disable_comfy_compiler):
         # ComfyUI owns one memory manager for the entire process.
         if "comfy.model_management" in sys.modules:
             return getattr(sys.modules.get("comfy.memory_management"), "aimdo_enabled", False)
@@ -78,6 +81,11 @@ class Runtime:
         if self.device == "cpu":
             return False
 
+        if disable_pinned_memory:
+            cli.args.disable_pinned_memory = True
+        if disable_comfy_compiler:
+            cli.args.disable_comfy_compiler = True
+            cli.args.disable_cuda_graphs = True
         if sage_attention and importlib.util.find_spec("sageattention") is not None:
             cli.args.use_sage_attention = True
         if fp16_accumulation:

@@ -24,6 +24,7 @@ MAX_PIXELS = 768 * 1344          # 视频画布面积上限（约 1.03 MP）
 FPS = 24
 AUDIO_LATENT_FPS = 40
 
+IMAGE_1K_EDGE = 1024              # 1k 方形边长，比例预设使用同等目标面积
 IMAGE_SIZE = 2048                 # H3-Image 默认边长（面积约 4.2 MP）
 IMAGE_MAX_EDGE = 3104             # H3-Image 实测可用上限（约 9.6 MP）
 IMAGE_REF_SHORT_EDGE = 1024       # Qwen 看到的参考图短边
@@ -83,8 +84,11 @@ def adapt_canvas(width: int, height: int) -> tuple[int, int]:
     )
 
 
-def size_within_area(width: int, height: int, pixels: int) -> tuple[int, int]:
-    scale = min(1.0, math.sqrt(pixels / (width * height)))
+def size_within_area(width: int, height: int, pixels: int, *, allow_upscale: bool = False) -> tuple[int, int]:
+    """按比例缩放到目标面积，再对齐画布网格。默认只缩小。"""
+    scale = math.sqrt(pixels / (width * height))
+    if not allow_upscale:
+        scale = min(1.0, scale)
     return tuple(
         max(CANVAS_MULTIPLE, round(side * scale / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
         for side in (width, height)
@@ -155,13 +159,13 @@ def resolve_canvas(kind: str, value, image_size=None) -> tuple[int, int]:
 
     if kind == "image":
         if text in ("1k", "2k", "max"):
-            edge = {"1k": 1024, "2k": IMAGE_SIZE, "max": IMAGE_MAX_EDGE}[text]
+            edge = {"1k": IMAGE_1K_EDGE, "2k": IMAGE_SIZE, "max": IMAGE_MAX_EDGE}[text]
             return edge, edge
         if text in IMAGE_ASPECTS:
             aw, ah = IMAGE_ASPECTS[text]
-            return size_within_area(aw, ah, 1024 * 1024)
+            return size_within_area(aw, ah, IMAGE_1K_EDGE ** 2, allow_upscale=True)
         raise ValueError(
-            "图片 resolution 支持 1k / 2k / max / match / WxH，收到 {!r}".format(value)
+            "图片 resolution 支持 1k / 2k / max / match / 16:9 / 9:16 / 1:1 / 4:3 / 3:4 / WxH，收到 {!r}".format(value)
         )
 
 

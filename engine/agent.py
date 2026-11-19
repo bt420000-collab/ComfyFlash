@@ -311,6 +311,8 @@ def render_requests(config, requests, report=None):
             results.append(result)
             if report:
                 report(position, result)
+                if host_buffer_error(result.get("error", {}).get("message", "")):
+                    break
         return results
 
 
@@ -318,36 +320,48 @@ def report_worker_result(position, result):
     print(json.dumps({"position": position, "result": result}, ensure_ascii=False), flush=True)
 
 
-def worker_memory_error(message):
+def host_buffer_error(message):
     message = message.lower()
     return any(word in message for word in (
-        "out of memory", "cudaerrormemoryallocation",
         "hostbuffer.read_file_slice failed", "hostbuffer.truncate failed",
     ))
 
 
-def worker_results(args, requests, index):
+def worker_memory_error(message):
+    message = message.lower()
+    return host_buffer_error(message) or "out of memory" in message or "cudaerrormemoryallocation" in message
+
+
+def worker_results(args, requests, index, *, safe_memory=False):
     paths = [str(path.expanduser().resolve()) for _, path in requests]
     environment = os.environ.copy()
     environment["CUDA_VISIBLE_DEVICES"] = device_mask(index, environment.get("CUDA_VISIBLE_DEVICES"))
     command = [sys.executable, "-B", str(ENTRY), "play", "--config", str(args.config), "--worker"]
+    if safe_memory:
+        command.append("--safe-memory")
     for path in paths:
         command.extend(("--request", path))
     results = []
     try:
         run = subprocess.run(command, env=environment, capture_output=True, encoding="utf-8", errors="replace")
+        diagnostics = run.stderr.strip().splitlines()
         for line in run.stdout.splitlines():
             try:
                 report = json.loads(line)
             except ValueError:
+                diagnostics.append(line)
                 continue
             if not isinstance(report, dict) or report.get("position") != len(results):
+                diagnostics.append(line)
                 continue
             item = report.get("result")
             if isinstance(item, dict) and isinstance(item.get("ok"), bool) and len(results) < len(paths):
                 results.append(item)
-        diagnostics = (run.stderr + "\n" + run.stdout).strip().splitlines()
-        memory_error = next((line for line in diagnostics if worker_memory_error(line)), None)
+        reported_errors = [result.get("error", {}).get("message", "") for result in results]
+        diagnostics = [line for line in reported_errors + diagnostics if line.strip()]
+        memory_error = next((line for line in diagnostics if host_buffer_error(line)), None)
+        if memory_error is None:
+            memory_error = next((line for line in diagnostics if worker_memory_error(line)), None)
         failure = memory_error or (diagnostics[-1] if diagnostics else f"进程退出码 {run.returncode}")
         error_code = "WORKER_MEMORY_ERROR" if memory_error else "WORKER_ERROR"
     except OSError as exc:
@@ -371,7 +385,14 @@ def play(args):
     paths = args.request if isinstance(args.request, list) else [args.request]
     requests = [read_json(path.expanduser()) for path in paths]
     if getattr(args, "worker", False):
-        return batch_result(render_requests(args.config, requests, report_worker_result), [])
+        config = load_config(args.config)
+        if args.safe_memory:
+            config.update(disable_pinned_memory=True, disable_comfy_compiler=True)
+        elif sys.platform == "win32" and config.get("dynamic_vram", True):
+            # Separate GPU workers still compete for the same pinned host memory.
+            config.setdefault("disable_pinned_memory", True)
+        results = render_requests(config, requests, report_worker_result)
+        return batch_result(results, [])
     if len(requests) == 1:
         device = load_config(args.config).get("device", "cuda:0")
         inherited = os.getenv("CUDA_VISIBLE_DEVICES")
@@ -399,18 +420,22 @@ def play(args):
                    for slot, index in enumerate(devices)]
         finished = dict(item for worker in workers for item in worker.result())
     serial_retries = 0
-    if len(devices) > 1:
-        retry = []
-        for position, output in finished.items():
-            error = output.get("error", {})
-            if error.get("code") in {"OOM", "WORKER_MEMORY_ERROR"} or worker_memory_error(error.get("message", "")):
-                retry.append((position, paths[position]))
-        if retry:
-            refreshed = hardware_report(probe_python(sys.executable, hardware_only=True), preferred)
-            available = most_free_device(refreshed)
-            if available is not None:
-                finished.update(worker_results(args, sorted(retry), available["index"]))
-                serial_retries = len(retry)
+    safe_memory = False
+    retry = []
+    for position, output in finished.items():
+        error = output.get("error", {})
+        message = error.get("message", "")
+        if host_buffer_error(message):
+            safe_memory = True
+            retry.append((position, paths[position]))
+        elif len(devices) > 1 and (error.get("code") in {"OOM", "WORKER_MEMORY_ERROR"} or worker_memory_error(message)):
+            retry.append((position, paths[position]))
+    if retry:
+        refreshed = hardware_report(probe_python(sys.executable, hardware_only=True), preferred)
+        available = most_free_device(refreshed)
+        if available is not None:
+            finished.update(worker_results(args, sorted(retry), available["index"], safe_memory=safe_memory))
+            serial_retries = len(retry)
     result = batch_result([finished[position] for position in range(len(paths))], devices)
     if serial_retries:
         result["serial_retries"] = serial_retries
@@ -436,6 +461,7 @@ def main():
     render = actions.add_parser("play", help="从 JSON 请求直接生成")
     render.add_argument("--request", type=Path, action="append", required=True, help="可重复传入多个请求")
     render.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
+    render.add_argument("--safe-memory", action="store_true", help=argparse.SUPPRESS)
     render.set_defaults(handler=play)
     for action in (setup, download, render):
         action.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
