@@ -65,6 +65,11 @@ class RegistrationTests(unittest.TestCase):
         self.assertTrue(saved["fp16_accumulation"])
         target = self.project / ".agents/skills/comfyflash/SKILL.md"
         self.assertEqual(Path(first["guide"]), target)
+        installed = target.read_text(encoding="utf-8")
+        for name in ("h3-video.md", "h3-image.md"):
+            reference = agent.GUIDE.parent / "references" / name
+            self.assertIn(f"(<{reference.as_posix()}>)", installed)
+            self.assertTrue(reference.is_file())
         original = target.read_bytes()
         time = target.stat().st_mtime_ns
         second = self.run_registration()
@@ -80,6 +85,12 @@ class RegistrationTests(unittest.TestCase):
         self.assertEqual(result["scope"], "conversation")
         self.assertTrue(all(item["ready"] for item in result["functions"]))
         self.assertFalse(any(self.project.iterdir()))
+        guide = Path(result["guide"])
+        content = guide.read_text(encoding="utf-8")
+        for name in ("h3-video.md", "h3-image.md"):
+            reference = f"references/{name}"
+            self.assertIn(f"({reference})", content)
+            self.assertTrue((guide.parent / reference).is_file())
 
     def test_no_weights_do_not_create_installed_skill(self):
         result = self.run_registration()

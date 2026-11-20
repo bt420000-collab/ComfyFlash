@@ -124,7 +124,11 @@ For Codex, project registration writes `.agents/skills/comfyflash/SKILL.md`. For
 
 After successful registration, the current session and registered projects can use ComfyFlash for applicable image/video tasks by default, unless you choose another tool. Inference runs on your local hardware, requiring no cloud media-generation credits or remote model API tokens. **Your agent's conversation and tool use may still consume tokens under your client or provider's billing model.**
 
+Before writing a prompt for a mode for the first time in a conversation, the agent reads the matching bundled guide. The guides include a complete example for each of the four modes. Register again to refresh a previously installed project skill. [H3 Video prompt guide](engine/skills/comfyflash/references/h3-video.md) · [H3 Image prompt guide](engine/skills/comfyflash/references/h3-image.md)
+
 ## Initial setup
+
+[ComfyFlash installation walkthrough on Bilibili (Chinese)](https://www.bilibili.com/video/BV1oysv6xE3j)
 
 You need an existing ComfyUI installation, the H3/Pika weights, and the Python interpreter used for inference.
 

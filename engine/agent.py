@@ -253,6 +253,9 @@ def register(args):
         skill = project_skill(args)
         exclude_skill_from_git(args.project.expanduser().resolve(), skill)
         source = GUIDE.read_text(encoding="utf-8")
+        for name in ("h3-video.md", "h3-image.md"):
+            relative = f"references/{name}"
+            source = source.replace(f"({relative})", f"(<{(GUIDE.parent / relative).as_posix()}>)")
         skill_text = source.rstrip() + "\n\n" + MANAGED + "\n\n"
         skill_text += "## 本项目调用配置\n\n"
         skill_text += "把下列数组作为执行参数，在末尾追加 `--request` 和请求 JSON 的绝对路径。\n\n"

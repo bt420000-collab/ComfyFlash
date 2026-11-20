@@ -121,7 +121,11 @@ with Flash() as flash:
 
 注册通过后，除非你指定其他工具，当前对话及已注册项目默认使用 ComfyFlash 生图、生成视频和编辑图片。ComfyFlash 在本机生成，消耗本机算力，云端生成额度和 API token 消耗为零。Agent 的对话和工具调度仍按客户端计量。
 
+Agent 在当前对话首次编写某种生成或编辑提示词前，会读取随包提供的对应指南。两份指南覆盖四种功能，每种都附一个完整示例。已有的项目技能可通过重新注册更新。[H3 视频提示词指南](engine/skills/comfyflash/references/h3-video.md) · [H3 图片提示词指南](engine/skills/comfyflash/references/h3-image.md)
+
 ## 首次配置
+
+[ComfyFlash 安装视频（哔哩哔哩）](https://www.bilibili.com/video/BV1oysv6xE3j)
 
 提供现有的 ComfyUI 安装、H3/Pika 权重和它的推理 Python。最新维护环境使用 ComfyUI 提交 [`0228a9d73`](https://github.com/Comfy-Org/ComfyUI/tree/0228a9d73)、Python 3.13、PyTorch 2.13、CUDA 13 及 NVIDIA 显卡。用普通 Python 3.10+ 执行注册即可，注册会查找已有的便携 Python 或虚拟环境。
 
