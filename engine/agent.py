@@ -18,7 +18,7 @@ if not __package__:
     sys.path.insert(0, str(ROOT))
 
 from engine import Flash
-from engine.core import DEFAULT_CONFIG, load_config
+from engine.core import DEFAULT_CONFIG, ParamError, load_config
 from engine.setup_checks import (
     ARTIFACTS, INSTALL_GUIDE, MODEL_LICENSES, choose_python, download_space, download_weight,
     hardware_report, model_issue, probe_python,
@@ -137,16 +137,40 @@ def check_models(settings):
             for model in flash.tone_info(tone["tone"])["models"]:
                 path = Path(model["path"]).expanduser().resolve()
                 if path not in checked:
-                    entry = ARTIFACTS[model["file"]]
-                    checked[path] = model_issue(path, entry)
+                    entry = ARTIFACTS.get(model["file"])
+                    if entry is not None:
+                        checked[path] = model_issue(path, entry)
+                    else:
+                        checked[path] = None if path.is_file() else "missing_local"
                     if checked[path]:
-                        problems[path] = {**entry, "path": str(path), "file": model["file"],
+                        problems[path] = {**(entry or {}), "path": str(path), "file": model["file"],
                                           "issue": checked[path], "tones": []}
                 if checked[path]:
                     absent.append(str(path))
                     problems[path]["tones"].append(tone["tone"])
             functions.append({**tone, "ready": not absent, "missing": absent})
     return functions, list(problems.values())
+
+
+def discover(args):
+    configured = args.config is not None or DEFAULT_CONFIG.is_file()
+    config = args.config if configured else {"comfyui_root": str(ROOT)}
+    with Flash(config=config) as flash:
+        if args.tone is None:
+            return {"ok": True, "configured": configured, "tones": flash.tone_list()}
+        try:
+            info = flash.tone_info(args.tone)
+        except ParamError as exc:
+            return {"ok": False, "code": exc.code, "message": str(exc)}
+        if info.get("prompt_guide_ref"):
+            info["prompt_guide_ref"] = str((ROOT / info["prompt_guide_ref"]).resolve())
+        return {"ok": True, "configured": configured, "info": info}
+
+
+def preflight(args):
+    request = read_json(args.request.expanduser())
+    with Flash(config=args.config) as flash:
+        return flash.preflight(**request)
 
 
 def project_skill(args):
@@ -205,7 +229,9 @@ def exclude_skill_from_git(project, skill):
 def register(args):
     skill = project_skill(args)
     config, original, settings, comfy, comfy_issue = setup_settings(args)
-    functions, missing = check_models(settings)
+    functions, problems = check_models(settings)
+    missing = [item for item in problems if "url" in item]
+    missing_local = [item for item in problems if "url" not in item]
     runtime = choose_python(comfy, args.python or settings.get("python"))
     if not args.python and settings.get("python") and (
         not runtime["ready"] or not any(gpu["ready"] for gpu in runtime["gpus"])
@@ -218,7 +244,9 @@ def register(args):
         item["ready"] = item["models_ready"] and environment_ready
     result = {"ok": False, "config": str(config), "functions": functions, "python": runtime,
               "hardware": hardware, "comfyui_root": str(comfy) if comfy else None}
-    if missing or not environment_ready:
+    if missing_local:
+        result["missing_local_models"] = missing_local
+    if missing or not environment_ready or not any(item["ready"] for item in functions):
         needs_cuda_build = hardware["detected_gpu_count"] > 0 and not runtime.get("cuda")
         result.update(
             code="MISSING_MODELS" if environment_ready else "ENVIRONMENT_NOT_READY",
@@ -249,24 +277,26 @@ def register(args):
             settings.setdefault(option, True)
         video_acceleration[option] = bool(settings.get(option, False))
     argv = [str(python), "-B", str(ENTRY), "play", "--config", str(config)]
+    discovery = {
+        "tone_list_argv": [str(python), "-B", str(ENTRY), "tone-list", "--config", str(config)],
+        "tone_info_argv": [str(python), "-B", str(ENTRY), "tone-info", "--config", str(config)],
+    }
     if skill:
         skill = project_skill(args)
         exclude_skill_from_git(args.project.expanduser().resolve(), skill)
         source = GUIDE.read_text(encoding="utf-8")
-        for name in ("h3-video.md", "h3-image.md"):
-            relative = f"references/{name}"
-            source = source.replace(f"({relative})", f"(<{(GUIDE.parent / relative).as_posix()}>)")
         skill_text = source.rstrip() + "\n\n" + MANAGED + "\n\n"
         skill_text += "## 本项目调用配置\n\n"
         skill_text += "把下列数组作为执行参数，在末尾追加 `--request` 和请求 JSON 的绝对路径。\n\n"
         skill_text += "```json\n" + json_text(argv) + "```\n"
+        skill_text += "\n能力发现命令：\n\n```json\n" + json_text(discovery) + "```\n"
     if settings != original or not config.is_file():
         write_text(config, json_text(settings))
     if skill:
         if not skill.exists() or skill.read_text(encoding="utf-8") != skill_text:
             write_text(skill, skill_text)
 
-    names = "、".join(f"{item['tone']} {item['name']}" for item in functions)
+    names = "、".join(f"{item['tone']} {item['name']}" for item in functions if item["ready"])
     scope = "项目和当前对话" if skill else "当前对话"
     return {
         **result, "ok": True,
@@ -276,6 +306,7 @@ def register(args):
         "local_render": LOCAL_RENDER,
         "video_acceleration": video_acceleration,
         "play_argv": argv,
+        **discovery,
         "guide": str(skill or GUIDE),
     }
 
@@ -289,7 +320,7 @@ def download_models(args):
     _, missing = check_models(settings)
     downloaded = []
     for entry in missing:
-        if download_weight(entry):
+        if "url" in entry and download_weight(entry):
             downloaded.append(entry["path"])
     return {"ok": True, "downloaded": downloaded, "message": "运行 register 重新检查并注册。"}
 
@@ -461,12 +492,22 @@ def main():
     download.add_argument("--comfyui-root")
     download.add_argument("--models-path")
     download.set_defaults(handler=download_models)
+    tones = actions.add_parser("tone-list", help="读取当前能力目录")
+    tones.set_defaults(handler=discover, tone=None)
+    info = actions.add_parser("tone-info", help="读取指定 Tone 的参数契约及指南")
+    info.add_argument("tone", help="tone-list 返回的 Tone ID")
+    info.set_defaults(handler=discover)
+    for action in (tones, info):
+        action.add_argument("--config", type=Path, help="用于检查本机模型路径的配置")
+    check = actions.add_parser("preflight", help="检查请求和依赖，不加载推理模型")
+    check.add_argument("--request", type=Path, required=True)
+    check.set_defaults(handler=preflight)
     render = actions.add_parser("play", help="从 JSON 请求直接生成")
     render.add_argument("--request", type=Path, action="append", required=True, help="可重复传入多个请求")
     render.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     render.add_argument("--safe-memory", action="store_true", help=argparse.SUPPRESS)
     render.set_defaults(handler=play)
-    for action in (setup, download, render):
+    for action in (setup, download, check, render):
         action.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     args = cli.parse_args()
     try:

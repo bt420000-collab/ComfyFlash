@@ -13,7 +13,9 @@ from __future__ import annotations
 
 from .. import h3
 
-TONE = {
+from .h3_contract import h3_tone
+
+TONE = h3_tone({
     "id": "t1",
     "name": "Pika 文生视频",
     "purpose": "一句 prompt 生成带同期声的短视频，Pika Flex 的运动与镜头质感",
@@ -57,7 +59,7 @@ TONE = {
         "只吃 prompt；需要参考图请换 t2。",
         "声音由模型联合生成，v0.1 不接受 audio_in。",
     ],
-}
+}, capability="text_to_video")
 
 
 def play(run):

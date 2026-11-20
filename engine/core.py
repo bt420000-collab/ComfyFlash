@@ -15,12 +15,14 @@ import contextlib
 import io as _io
 import json
 import logging
+import os
 import random
 import threading
 import time
 from pathlib import Path
 
-from . import h3, media
+from . import contracts, h3, media
+from .contracts import ParamError
 from .bank import TONES
 from .runtime import Runtime
 
@@ -39,15 +41,6 @@ _MODEL_KINDS = {
 # 同进程热复用，但不许把整套模型都攒在内存里：每类最多留几个。
 _CACHE_LIMITS = {"unet": 1, "patched_unet": 1, "clip": 1, "vae": 2, "lora": 2}
 _EXECUTION_LOCK = threading.RLock()
-
-
-class ParamError(Exception):
-    """参数/依赖层面的失败：可预期、可读、不打印堆栈。"""
-
-    def __init__(self, code: str, message: str):
-        super().__init__(message)
-        self.code = code
-        self.message = message
 
 
 # --------------------------------------------------------------------- config
@@ -73,7 +66,7 @@ def resolve_config(settings, path=None) -> dict:
     return cfg
 
 
-def _normalize_images(value) -> list[str]:
+def _normalize_images(value, field) -> list[str]:
     if isinstance(value, (str, Path)):
         items = [value]
     elif isinstance(value, (list, tuple)):
@@ -81,16 +74,19 @@ def _normalize_images(value) -> list[str]:
     else:
         raise ParamError("BAD_INPUT", "image_in 只接受路径字符串或路径列表，收到 {}".format(type(value).__name__))
 
+    minimum, maximum = field["min_items"], field["max_items"]
+    if not minimum <= len(items) <= maximum:
+        raise ParamError("BAD_INPUT", f"image_in received {len(items)} images; allowed {minimum}..{maximum}")
     paths = []
     for item in items:
+        if not isinstance(item, (str, Path)):
+            raise ParamError("BAD_INPUT", "image_in requires path strings")
         p = Path(str(item)).expanduser()
         if not p.is_absolute():
             raise ParamError("BAD_INPUT", "image_in 必须是绝对路径：{}".format(p))
         if not p.is_file():
             raise ParamError("BAD_INPUT", "找不到输入图片：{}".format(p))
         paths.append(str(p))
-    if not paths:
-        raise ParamError("BAD_INPUT", "image_in 是空的")
     return paths
 
 
@@ -197,6 +193,8 @@ class _Run:
             frames = self.rt.decode(vae, samples["samples"])
         if frames.dim() == 5:
             frames = frames.reshape(-1, frames.shape[-3], frames.shape[-2], frames.shape[-1])
+        if self.video:
+            self.meta["decoded_frame_count"] = int(frames.shape[0])
         if self.frames and frames.shape[0] > self.frames:
             frames = frames[: self.frames]
         return frames
@@ -208,16 +206,21 @@ class _Run:
             return self.rt.decode_audio(vae_audio, samples["samples"])
 
     def save_video(self, frames, audio=None):
-        if frames.dim() == 4 and frames.shape[0] == 1 and self.frames == 1:
-            raise ParamError("BAD_OUTPUT", "t1/t2 产出的帧数异常（只有 1 帧），请检查模型")
+        total = int(frames.shape[0])
+        if total < 1:
+            raise ParamError("BAD_OUTPUT", "Video decoder returned zero frames")
+        rate = self.req["fps"]
         with self.timed_video_stage("encoding"):
-            path = media.save_video(frames, self.output, fps=h3.FPS, audio=audio)
+            path = media.save_video(frames, self.output, fps=rate, audio=audio)
+        decoded = self.meta.get("decoded_frame_count", total)
         self.meta.update({
-            "width": int(frames.shape[2]),
-            "height": int(frames.shape[1]),
-            "frames": int(frames.shape[0]),
-            "duration": round(frames.shape[0] / h3.FPS, 3),
-            "fps": h3.FPS,
+            "width": int(frames.shape[2]), "height": int(frames.shape[1]),
+            "frames": total, "duration": round(total / rate, 3), "fps": rate,
+            "requested_duration_s": self.req["requested_duration_s"],
+            "requested_frame_count": self.req["requested_frame_count"],
+            "aligned_frame_count": self.frames, "decoded_frame_count": decoded,
+            "trimmed_frame_count": max(0, decoded - total),
+            "actual_frame_count": total, "actual_duration_s": total / rate,
         })
         return path
 
@@ -320,30 +323,34 @@ class Flash:
         out = []
         for tone_id, module in TONES.items():
             spec = module.TONE
-            out.append({
-                "tone": tone_id,
-                "name": spec["name"],
-                "purpose": spec["purpose"],
-                "output": spec["output"],
-                "inputs": spec["inputs"],
-            })
+            fields = spec["inputs"].get("fields", {})
+            row = {k: spec.get(k) for k in ("name", "purpose", "output", "inputs", "schema_version",
+                                             "version", "tags", "capabilities", "hardware_requirements", "latency_class")}
+            row.update(id=tone_id, tone=tone_id, schema_hash=contracts.schema_hash(contracts.request_schema(spec)),
+                       media_inputs=sorted({field["media_type"] for field in fields.values()}),
+                       media_outputs=[spec["output"]] + (["audio"] if spec["outputs"].get("audio_required") else []))
+            out.append(row)
         return out
 
     def tone_info(self, tone: str):
         spec = self._spec(tone)
         info = json.loads(json.dumps(spec, ensure_ascii=False))
+        info["schema"] = contracts.request_schema(info)
+        info["schema_hash"] = contracts.schema_hash(info["schema"])
         deps = []
         for key, name in (spec.get("models") or {}).items():
             kind = _MODEL_KINDS[key]
             path = Path(str(name))
             if not path.is_absolute():
                 path = Path(self._cfg["_dirs"][kind]) / path
+            exists = path.is_file()
             deps.append({
                 "role": key,
                 "dir": kind,
                 "file": path.name,
                 "path": str(path),
-                "exists": path.is_file(),
+                "exists": exists,
+                "status": "available" if exists else "missing",
             })
         info["models"] = deps
         info["models_ready"] = all(item["exists"] for item in deps)
@@ -351,6 +358,24 @@ class Flash:
         return info
 
     # ------------------------------------------------------------- 演奏
+    def _check_models(self, spec):
+        for key, name in spec.get("models", {}).items():
+            self.model_path(name, _MODEL_KINDS[key])
+
+    def preflight(self, tone, prompt=None, image_in=None, audio_in=None, resolution=None,
+                  duration=None, seed=None, output=None, verbose=None, **advanced):
+        """Resolve a request and check local dependencies without starting inference."""
+        started = time.time()
+        seed_value = None
+        try:
+            spec = self._spec(tone)
+            req = self._resolve(spec, prompt, image_in, audio_in, resolution, duration, seed, output, advanced)
+            seed_value = req["seed"]
+            self._check_models(spec)
+            return {"ok": True, "tone": tone, "resolved": req}
+        except ParamError as exc:
+            return self._fail(tone, seed_value, exc, None, started, exc.code)
+
     def play(
         self,
         tone: str,
@@ -372,8 +397,7 @@ class Flash:
             req = self._resolve(spec, prompt, image_in, audio_in, resolution, duration, seed, output, advanced)
             seed_value = req["seed"]
 
-            for key, name in (spec.get("models") or {}).items():
-                self.model_path(name, _MODEL_KINDS[key])
+            self._check_models(spec)
 
             with self._lock:
                 if self._closed:
@@ -469,141 +493,71 @@ class Flash:
         accepted = required + list(inputs.get("optional", []))
         controls = spec.get("controls", {})
 
-        # prompt
-        if "prompt" in accepted:
-            if prompt is None or not str(prompt).strip():
-                raise ParamError("MISSING_INPUT", "{} 需要非空 prompt".format(spec["name"]))
-            prompt = str(prompt).strip()
+        if prompt is None and "prompt" in required:
+            raise ParamError("MISSING_INPUT", f"{spec['name']} requires prompt")
+        if prompt is not None:
+            if "prompt" not in accepted:
+                raise ParamError("UNSUPPORTED_INPUT", f"{spec['name']} does not accept prompt")
+            prompt = contracts.scalar_value("prompt", prompt, controls["prompt"], "MISSING_INPUT").strip()
+        if audio_in is not None:
+            raise ParamError("UNSUPPORTED_INPUT", f"{spec['name']} does not accept audio_in")
 
-        # image_in
-        images: list[str] = []
+        images = []
+        image_size = None
         if image_in is not None:
             if "image_in" not in accepted:
-                raise ParamError(
-                    "UNSUPPORTED_INPUT",
-                    "{} 不接受 image_in；需要参考图的音色是 t2 / t4".format(spec["name"]),
-                )
-            images = _normalize_images(image_in)
+                raise ParamError("UNSUPPORTED_INPUT", f"{spec['name']} does not accept image_in")
+            images = _normalize_images(image_in, inputs["fields"]["image_in"])
+            for path in images:
+                try:
+                    size = media.image_size(path)
+                except (OSError, ValueError, SyntaxError) as exc:
+                    raise ParamError("BAD_INPUT", f"Unreadable image {path}: {exc}") from exc
+                if image_size is None:
+                    image_size = size
         elif "image_in" in required:
-            raise ParamError("MISSING_INPUT", "{} 需要 image_in（参考图/待编辑图）".format(spec["name"]))
+            raise ParamError("MISSING_INPUT", f"{spec['name']} requires image_in")
 
-        # audio_in：v0.1 一律不实现，避免虚假能力
-        if audio_in is not None:
-            raise ParamError(
-                "UNSUPPORTED_INPUT",
-                "v0.1 的四个 Tone 都不接受 audio_in；H3 的同期声音由模型自身生成，"
-                "这里不提供音频输入接口",
-            )
-
-        # output
-        if output is None or not str(output).strip():
-            raise ParamError("MISSING_OUTPUT", "output 必须是完整输出路径，例如 D:/MV/shot01.mp4")
-        out_path = Path(str(output)).expanduser()
+        if not isinstance(output, (str, Path)) or not str(output).strip():
+            raise ParamError("MISSING_OUTPUT", "output must be an absolute file path")
+        out_path = Path(output).expanduser()
         if not out_path.is_absolute():
-            raise ParamError("MISSING_OUTPUT", "output 必须是绝对路径，收到 {}".format(out_path))
-        ext = out_path.suffix.lower()
-        if spec["output"] == "video" and ext not in media.VIDEO_EXT:
-            raise ParamError(
-                "BAD_OUTPUT", "{} 产出视频，扩展名需为 {}，收到 {!r}".format(
-                    spec["name"], "/".join(sorted(media.VIDEO_EXT)), ext
-                ),
-            )
-        if spec["output"] == "image" and ext not in media.IMAGE_EXT:
-            raise ParamError(
-                "BAD_OUTPUT", "{} 产出图片，扩展名需为 {}，收到 {!r}".format(
-                    spec["name"], "/".join(sorted(media.IMAGE_EXT)), ext
-                ),
-            )
+            raise ParamError("MISSING_OUTPUT", f"output must be absolute: {out_path}")
+        if "\0" in str(out_path):
+            raise ParamError("BAD_OUTPUT", "Output path contains a NUL character")
+        if os.name == "nt":
+            for part in out_path.parts[1:]:
+                if hasattr(os.path, "isreserved"):
+                    reserved = os.path.isreserved(part)
+                else:  # Windows Python 3.10–3.12
+                    reserved = (Path(part).is_reserved() or part.endswith((" ", ".")) or
+                                any(ord(c) < 32 or c in '<>:"|?*' for c in part))
+                if reserved and part != "..":
+                    raise ParamError("BAD_OUTPUT", f"Reserved Windows path component: {part!r}")
+        formats = spec["outputs"]["formats"]
+        if out_path.suffix.lower() not in formats or out_path.is_dir():
+            raise ParamError("BAD_OUTPUT", f"Expected an output file with extension in {formats}: {out_path}")
+        parent = next((p for p in out_path.parents if p.exists()), None)
+        if parent is None or not parent.is_dir() or not os.access(parent, os.W_OK):
+            raise ParamError("BAD_OUTPUT", f"Output parent cannot be created or written: {out_path.parent}")
 
-        # duration
-        frames = None
-        duration_value = None
-        if duration is not None and "duration" not in controls:
-            raise ParamError(
-                "UNSUPPORTED_CONTROL",
-                "{} 是图像 Tone，不使用 duration".format(spec["name"]),
-            )
-        if "duration" in controls:
-            decl = controls["duration"]
-            duration_value = decl["default"] if duration is None else float(duration)
-            if not (decl["min"] <= duration_value <= decl["max"]):
-                raise ParamError(
-                    "BAD_DURATION",
-                    "duration 需在 {}–{} 秒之间，收到 {}".format(decl["min"], decl["max"], duration_value),
-                )
-            frames = h3.align_frame_count(round(duration_value * h3.FPS))
-
-        # seed
+        advanced = dict(advanced)
+        timing = contracts.resolve_time(spec, duration, advanced.pop("fps", None))
         if seed is None:
             seed_value = random.SystemRandom().randrange(0, 2 ** 31)
         else:
             if isinstance(seed, bool) or not isinstance(seed, int):
-                raise ParamError("BAD_SEED", "seed 必须是整数或 None，收到 {!r}".format(seed))
+                raise ParamError("BAD_SEED", f"seed must be an integer: {seed!r}")
             seed_value = seed % (2 ** 63)
 
-        # resolution
-        decl = controls.get("resolution", {})
-        res_value = decl.get("default") if resolution is None else resolution
-        image_size = media.image_size(images[0]) if images and str(res_value).lower() == "match" else None
-        try:
-            width, height = h3.resolve_canvas(spec["output"], res_value, image_size)
-        except ValueError as exc:
-            raise ParamError("BAD_RESOLUTION", str(exc))
-
-        provided = set(advanced)
-        params = {}
-        for key, decl in (spec.get("advanced") or {}).items():
-            value = advanced.pop(key, decl.get("default"))
-            if "choices" in decl and value is not None and value not in decl["choices"]:
-                raise ParamError(
-                    "BAD_PARAM",
-                    "{} 的 {} 只支持 {}，收到 {!r}".format(
-                        spec["name"], key, "/".join(map(str, decl["choices"])), value
-                    ),
-                )
-            if "min" in decl:
-                try:
-                    value = float(value)
-                except (TypeError, ValueError):
-                    raise ParamError("BAD_PARAM", "{} 必须是数字".format(key))
-                if not (decl["min"] <= value <= decl["max"]):
-                    raise ParamError(
-                        "BAD_PARAM",
-                        "{} 需在 {}–{} 之间，收到 {}".format(key, decl["min"], decl["max"], value),
-                    )
-                if isinstance(decl.get("default"), int):
-                    value = int(round(value))
-            params[key] = value
-        if spec["output"] == "video":
-            # Omitted knobs retain their v0.1 defaults for custom sampling recipes.
-            if "scheduler" not in provided and provided & {"steps", "sampler", "cfg"}:
-                uses_pika = "sampler" in provided and params["sampler"] == "lcm" and params["steps"] == 6
-                if not uses_pika:
-                    params["scheduler"] = "simple"
-            if params["scheduler"] != "pika":
-                if "steps" not in provided:
-                    params["steps"] = 20
-                if "sampler" not in provided:
-                    params["sampler"] = "res_multistep"
-            elif params["sampler"] != "lcm" or params["steps"] != len(h3.PIKA_SIGMAS) - 1:
-                raise ParamError("BAD_PARAM", "pika 调度需要 lcm 和 6 步；自定义采样请使用其他调度器")
-        if advanced:
-            raise ParamError(
-                "UNSUPPORTED_CONTROL",
-                "{} 不认识这些参数：{}（可用：{}）".format(
-                    spec["name"], ", ".join(sorted(advanced)), ", ".join(sorted(spec.get("advanced") or {})) or "无"
-                ),
-            )
-
+        decl = controls["resolution"]
+        res_value = decl["default"] if resolution is None else resolution
+        res_value = contracts.scalar_value("resolution", res_value, decl, "BAD_RESOLUTION")
+        width, height = contracts.resolve_canvas(spec, res_value, image_size)
+        params = contracts.resolve_advanced(spec, advanced)
         return {
-            "prompt": prompt,
-            "images": images,
-            "output": str(out_path),
-            "width": width,
-            "height": height,
-            "frames": frames,
-            "duration": duration_value,
-            "seed": seed_value,
-            "resolution": res_value,
-            "advanced": params,
+            "prompt": prompt, "images": images, "output": str(out_path),
+            "width": width, "height": height, "frames": timing.get("aligned_frame_count"),
+            "duration": timing.get("requested_duration_s"), "seed": seed_value,
+            "resolution": res_value, "advanced": params, **timing,
         }

@@ -13,7 +13,9 @@ from __future__ import annotations
 
 from .. import h3
 
-TONE = {
+from .h3_contract import h3_tone
+
+TONE = h3_tone({
     "id": "t3",
     "name": "H3 文生图",
     "purpose": "一句 prompt 出高质量静帧，默认 1024x1024",
@@ -44,7 +46,7 @@ TONE = {
         "图像 Tone 不使用 duration，传了会直接报错。",
         "要改图请换 t4（带 image_in）。",
     ],
-}
+}, capability="text_to_image")
 
 
 def play(run):

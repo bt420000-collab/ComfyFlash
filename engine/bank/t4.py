@@ -12,7 +12,9 @@ from __future__ import annotations
 
 from .. import h3, media
 
-TONE = {
+from .h3_contract import h3_tone
+
+TONE = h3_tone({
     "id": "t4",
     "name": "H3 图片编辑",
     "purpose": "给一张图加一句指令，按原图结构改画面",
@@ -21,7 +23,7 @@ TONE = {
     "controls": {
         "prompt": {"note": "用 <Picture 1> 指代原图，例如「把 <Picture 1> 的背景换成雪山黄昏」"},
         "image_in": {
-            "note": "单张待编辑图（绝对路径，可传 1 个元素的列表）；只取第一张",
+            "note": "单张待编辑图（绝对路径，可传 1 个元素的列表）",
             "limits": "Qwen 视觉通道缩到短边 1024，VAE ref latent 缩到短边 1024–2048",
         },
         "resolution": {
@@ -51,7 +53,7 @@ TONE = {
         "必须给 image_in；纯文字出图请换 t3。",
         "图像 Tone 不使用 duration，传了会直接报错。",
     ],
-}
+}, capability="image_edit", image_role="edit_source")
 
 
 def play(run):
@@ -62,8 +64,6 @@ def play(run):
     if "<Picture" not in prompt:
         prompt = str(run.params.get("prompt_prefix") or "") + prompt
 
-    if len(run.image_paths) > 1:
-        run.meta["images_note"] = "t4 只编辑第一张图，其余 {} 张已忽略".format(len(run.image_paths) - 1)
     images = [media.load_image(rt, run.image_paths[0])]
 
     cond, latent = run.condition(
