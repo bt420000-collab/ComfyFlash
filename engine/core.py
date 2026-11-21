@@ -12,6 +12,8 @@ Tone 只负责它自己的配方（模型、LoRA、采样器、条件拼装）�
 from __future__ import annotations
 
 import contextlib
+from functools import lru_cache
+import hashlib
 import io as _io
 import json
 import logging
@@ -21,7 +23,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import contracts, h3, media
+from . import artifact, contracts, h3, media, telemetry
 from .contracts import ParamError
 from .bank import TONES
 from .runtime import Runtime
@@ -66,19 +68,27 @@ def resolve_config(settings, path=None) -> dict:
     return cfg
 
 
-def _normalize_images(value, field) -> list[str]:
-    if isinstance(value, (str, Path)):
+def _normalize_images(value, field):
+    if isinstance(value, (str, Path, dict)):
         items = [value]
     elif isinstance(value, (list, tuple)):
         items = list(value)
     else:
-        raise ParamError("BAD_INPUT", "image_in 只接受路径字符串或路径列表，收到 {}".format(type(value).__name__))
+        raise ParamError("BAD_INPUT", "image_in requires a path, an image Artifact, or a list of them")
 
     minimum, maximum = field["min_items"], field["max_items"]
     if not minimum <= len(items) <= maximum:
         raise ParamError("BAD_INPUT", f"image_in received {len(items)} images; allowed {minimum}..{maximum}")
-    paths = []
+    paths, lineage = [], []
     for item in items:
+        metadata = None
+        if isinstance(item, dict):
+            if item.get("media_type") != "image":
+                raise ParamError("BAD_INPUT", "image_in requires an image Artifact")
+            inspection = item.get("inspection")
+            if isinstance(inspection, dict) and isinstance(inspection.get("metadata"), str):
+                metadata = inspection["metadata"]
+            item = item.get("path")
         if not isinstance(item, (str, Path)):
             raise ParamError("BAD_INPUT", "image_in requires path strings")
         p = Path(str(item)).expanduser()
@@ -87,14 +97,27 @@ def _normalize_images(value, field) -> list[str]:
         if not p.is_file():
             raise ParamError("BAD_INPUT", "找不到输入图片：{}".format(p))
         paths.append(str(p))
-    return paths
+        lineage.append(metadata)
+    return paths, lineage
+
+
+@lru_cache(maxsize=64)
+def _weight_signature(path, size, modified_ns):
+    """Sample model bytes without reading the full checkpoint on each cold run."""
+    digest = hashlib.sha256(str(size).encode("ascii") + b"\0")
+    with path.open("rb") as stream:
+        digest.update(stream.read(65536))
+        if size > 65536:
+            stream.seek(max(65536, size - 65536))
+            digest.update(stream.read(65536))
+    return digest.hexdigest()
 
 
 # ------------------------------------------------------------------ run context
 class _Run:
     """一次生成请求的上下文：模型取用 + 采样 + 解码 + 落盘。"""
 
-    def __init__(self, engine: "Flash", spec: dict, req: dict):
+    def __init__(self, engine: "Flash", spec: dict, req: dict, attempt=None):
         self.engine = engine
         self.rt: Runtime = engine.runtime()
         self.spec = spec
@@ -109,15 +132,15 @@ class _Run:
         self.params = req["advanced"]
         self.meta: dict = {}
         self.video = spec["output"] == "video"
+        self.attempt = attempt or telemetry.Attempt(spec["id"])
+        self._model_details = None
 
     @contextlib.contextmanager
-    def timed_video_stage(self, name):
-        if not self.video:
+    def timed_stage(self, name):
+        with self.attempt.measure(name):
             yield
-            return
-        started = time.perf_counter()
-        yield
-        self.meta.setdefault("timing_s", {})[name] = round(time.perf_counter() - started, 2)
+        if self.video:
+            self.meta.setdefault("timing_s", {})[name] = round(self.attempt.timings[name], 2)
 
     # ---- 模型
     def _path(self, key: str) -> str:
@@ -128,29 +151,33 @@ class _Run:
 
     def unet(self):
         path = self._path("diffusion")
-        return self.engine.cached(("unet", path), self.rt.load_unet, path)
+        with self.attempt.measure("model_load"):
+            return self.engine.cached(("unet", path), self.rt.load_unet, path)
 
     def clip(self):
         path = self._path("text_encoder")
-        return self.engine.cached(("clip", path), self.rt.load_clip, path)
+        with self.attempt.measure("model_load"):
+            return self.engine.cached(("clip", path), self.rt.load_clip, path)
 
     def vae(self, key: str):
         path = self._path(key)
-        return self.engine.cached(("vae", path), self.rt.load_vae, path)
+        with self.attempt.measure("model_load"):
+            return self.engine.cached(("vae", path), self.rt.load_vae, path)
 
     def with_lora(self, model):
         strength = float(self.params.get("lora_strength", 1.0))
         if strength == 0.0:
             return model
         path = self._path("lora")
-        lora = self.engine.cached(("lora", path), self.rt.load_lora, path)
-        return self.engine.cached(
-            ("patched_unet", self._path("diffusion"), path, strength),
-            self.rt.apply_model_lora, model, lora, strength,
-        )
+        with self.attempt.measure("model_load"):
+            lora = self.engine.cached(("lora", path), self.rt.load_lora, path)
+            return self.engine.cached(
+                ("patched_unet", self._path("diffusion"), path, strength),
+                self.rt.apply_model_lora, model, lora, strength,
+            )
 
     def condition(self, build, *args, **kwargs):
-        with self.timed_video_stage("conditioning"), self.rt.stage():
+        with self.timed_stage("conditioning"), self.rt.stage():
             return build(self.rt, *args, **kwargs)
 
     # ---- 采样
@@ -162,7 +189,7 @@ class _Run:
         noise = self.rt.prepare_noise(latent["samples"], self.seed)
         sigmas = h3.PIKA_SIGMAS if p["scheduler"] == "pika" else None
         negative = None if sigmas is not None and p["cfg"] == 1.0 else h3.zero_out(cond)
-        with self.timed_video_stage("sampling"), self.rt.stage():
+        with self.timed_stage("sampling"), self.rt.stage():
             out = self.rt.sample_latent(
                 model,
                 cond,
@@ -180,17 +207,21 @@ class _Run:
 
     # ---- 解码 / 落盘
     def _offload_for_decode(self):
-        """视频解码前先把 20GB 底盘请出显存：解码器只要几 GB，混在一起必 OOM。"""
-        if self.rt.dynamic_vram or getattr(self, "_offloaded", False):
+        """Release model residency before the first decoder while keeping its latents."""
+        if self.rt.dynamic_vram and not self.engine._cfg.get("video_decode_offload", False):
             return
-        self.rt.offload_all()
+        if getattr(self, "_offloaded", False):
+            return
+        with self.attempt.measure("decode_offload"):
+            self.rt.offload_all()
         self._offloaded = True
 
     def decode_frames(self, vae, samples):
         if self.video:
             self._offload_for_decode()
-        with self.timed_video_stage("video_decode"), self.rt.stage():
-            frames = self.rt.decode(vae, samples["samples"])
+        with self.timed_stage("video_decode" if self.video else "image_decode"):
+            with self.rt.stage():
+                frames = self.rt.decode(vae, samples["samples"])
         if frames.dim() == 5:
             frames = frames.reshape(-1, frames.shape[-3], frames.shape[-2], frames.shape[-1])
         if self.video:
@@ -202,16 +233,46 @@ class _Run:
     def decode_audio(self, vae_audio, samples):
         if self.video:
             self._offload_for_decode()
-        with self.timed_video_stage("audio_decode"), self.rt.stage():
-            return self.rt.decode_audio(vae_audio, samples["samples"])
+        with self.timed_stage("audio_decode"):
+            with self.rt.stage():
+                return self.rt.decode_audio(vae_audio, samples["samples"])
+
+    def model_details(self):
+        if self._model_details is not None:
+            return self._model_details
+        models = []
+        for role in self.spec.get("models", {}):
+            path = Path(self._path(role)).resolve()
+            stat = path.stat()
+            models.append({"role": role, "file": path.name, "path": str(path), "size_bytes": stat.st_size,
+                           "fingerprint_algorithm": "sha256-size-and-edges-64k-v1",
+                           "fingerprint": _weight_signature(path, stat.st_size, stat.st_mtime_ns),
+                           "applied": role != "lora" or self.params.get("lora_strength", 1.0) != 0})
+        self._model_details = models
+        return models
+
+    def _artifact_details(self):
+        models = self.model_details()
+        role = self.spec["inputs"].get("fields", {}).get("image_in", {}).get("role")
+        sources = [{"role": role, "path": path, "metadata": meta}
+                   for path, meta in zip(self.image_paths, self.req["input_artifacts"])]
+        runtime = self.rt.versions()
+        if self.video:
+            runtime.update(self.rt.video_acceleration(), decode_offloaded=getattr(self, "_offloaded", False))
+        sampling = self.meta.get("sampling", {key: self.params[key] for key in ("steps", "sampler", "scheduler", "cfg")
+                                             if key in self.params})
+        return {**self.meta, "tone": self.spec["id"], "tone_version": self.spec.get("version"),
+                "seed": self.seed, "request_id": self.req.get("request_id"), "models": models,
+                "runtime": runtime, "sampling": sampling,
+                "effective_controls": {"prompt": self.prompt, "width": self.width, "height": self.height,
+                                       **self.params},
+                "provenance": {"inputs": sources, "requested_resolution": self.req["resolution"]}}
 
     def save_video(self, frames, audio=None):
         total = int(frames.shape[0])
         if total < 1:
             raise ParamError("BAD_OUTPUT", "Video decoder returned zero frames")
         rate = self.req["fps"]
-        with self.timed_video_stage("encoding"):
-            path = media.save_video(frames, self.output, fps=rate, audio=audio)
         decoded = self.meta.get("decoded_frame_count", total)
         self.meta.update({
             "width": int(frames.shape[2]), "height": int(frames.shape[1]),
@@ -222,21 +283,33 @@ class _Run:
             "trimmed_frame_count": max(0, decoded - total),
             "actual_frame_count": total, "actual_duration_s": total / rate,
         })
-        return path
+        details = self._artifact_details()
+        started = time.perf_counter()
+        with self.attempt.measure("delivery"):
+            delivered = artifact.deliver_video(
+                frames, self.output, details, fps=rate, audio=audio,
+                audio_required=self.spec["outputs"].get("audio_required", False),
+                inspection_frames=self.req["inspection_frames"], overwrite=self.req["overwrite"],
+            )
+        self.meta["timing_s"] = {**delivered["timing_s"], "delivery": round(time.perf_counter() - started, 2)}
+        self.meta["artifact"] = delivered
+        return delivered["path"]
 
     def save_image(self, tensor):
-        path = media.save_image(tensor, self.output)
-        self.meta.update({"width": int(tensor.shape[-2]), "height": int(tensor.shape[-3])})
-        return path
+        with self.attempt.measure("delivery"):
+            delivered = artifact.deliver_image(tensor, self.output, self._artifact_details(), overwrite=self.req["overwrite"])
+        self.meta.update(width=delivered["width"], height=delivered["height"], artifact=delivered)
+        return delivered["path"]
 
 
 # --------------------------------------------------------------------- Flash
 class Flash:
     """四个 Tone 的弹奏入口。同步、单进程、串行。"""
 
-    def __init__(self, config=None, verbose: bool = False):
+    def __init__(self, config=None, verbose: bool = False, *, _persist_history: bool = True):
         self._cfg = resolve_config(config) if isinstance(config, dict) else load_config(config)
         self.verbose = bool(verbose)
+        self._persist_history = _persist_history
         self._rt: Runtime | None = None
         self._cache: dict = {}
         self._tick: dict = {}
@@ -389,15 +462,29 @@ class Flash:
         verbose=None,
         **advanced,
     ):
+        attempt = telemetry.Attempt(tone, advanced.get("request_id"))
+        result = self._play(attempt, tone, prompt, image_in, audio_in, resolution, duration,
+                            seed, output, verbose, advanced)
+        try:
+            record = result["telemetry"] = attempt.finish(result)
+            if self._persist_history:
+                return telemetry.add_receipt(result, *telemetry.persist(self._cfg, [record]))
+        except (OSError, ValueError, TypeError) as exc:
+            telemetry.add_receipt(result, None, [{"code": "TELEMETRY_UNAVAILABLE", "message": str(exc)}])
+        return result
+
+    def _play(self, attempt, tone, prompt, image_in, audio_in, resolution, duration, seed, output,
+              verbose, advanced):
         started = time.time()
         seed_value = None
         verbose = self.verbose if verbose is None else bool(verbose)
         try:
-            spec = self._spec(tone)
-            req = self._resolve(spec, prompt, image_in, audio_in, resolution, duration, seed, output, advanced)
-            seed_value = req["seed"]
-
-            self._check_models(spec)
+            with attempt.measure("preflight"):
+                spec = self._spec(tone)
+                req = self._resolve(spec, prompt, image_in, audio_in, resolution, duration, seed, output, advanced)
+                seed_value = req["seed"]
+                attempt.configure(spec, req, self._cfg)
+                self._check_models(spec)
 
             with self._lock:
                 if self._closed:
@@ -405,7 +492,9 @@ class Flash:
                 buf_out, buf_err = _io.StringIO(), _io.StringIO()
                 try:
                     with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
-                        rt = self.runtime()
+                        with attempt.measure("runtime_init"):
+                            rt = self.runtime()
+                            attempt.enter_runtime(rt)
                         with rt.generation():
                             if not rt.dynamic_vram:
                                 reserve = self._cfg.get(
@@ -416,17 +505,29 @@ class Flash:
                                     rt.hard_reset()
                                 else:
                                     rt.offload_all()
-                            run = _Run(self, spec, req)
-                            path = TONES[tone].play(run)
+                            run = _Run(self, spec, req, attempt)
+                            try:
+                                attempt.set_models(run.model_details())
+                            except (OSError, ParamError):
+                                pass  # Path and role remain available when a model can't be signed.
+                            with attempt.measure("generation"):
+                                path = TONES[tone].play(run)
                             meta = dict(run.meta)
                             if run.video:
-                                meta["runtime"] = rt.video_acceleration()
+                                meta["runtime"] = {**rt.video_acceleration(),
+                                                   "decode_offloaded": getattr(run, "_offloaded", False)}
                 except Exception as exc:  # 运行时失败：保留可定位的诊断信息
+                    delivery_failed = isinstance(exc, artifact.DeliveryError)
+                    cause = (exc.__cause__ or exc) if delivery_failed else exc
+                    oom = ((self._rt is not None and self._rt.is_oom(cause))
+                           or "out of memory" in str(cause).lower())
+                    if delivery_failed and not oom:
+                        raise
                     detail = (buf_err.getvalue() or "") + (buf_out.getvalue() or "")
-                    oom = self._rt is not None and self._rt.is_oom(exc)
-                    result = self._fail(tone, seed_value, exc, detail, started, "OOM" if oom else "RUNTIME_ERROR")
+                    result = self._fail(tone, seed_value, cause, detail, started, "OOM" if oom else "RUNTIME_ERROR")
                     if result["error"]["code"] == "OOM" and self._rt is not None:
                         exc.__traceback__ = None
+                        cause.__traceback__ = None
                         try:
                             self._rt.hard_reset()
                         except Exception:
@@ -435,6 +536,8 @@ class Flash:
                             self._cache.clear()
                             self._tick.clear()
                     return result
+                finally:
+                    attempt.snapshot("end")
 
             result = {
                 "ok": True,
@@ -444,10 +547,18 @@ class Flash:
                 "elapsed_s": round(time.time() - started, 2),
             }
             result.update(meta)
+            if "request_id" in req:
+                result["request_id"] = req["request_id"]
             if verbose:
                 result["log"] = (buf_err.getvalue() + buf_out.getvalue())[-4000:]
             return result
 
+        except artifact.DeliveryError as exc:
+            result = self._fail(tone, seed_value, exc, None, started, exc.code)
+            result["validation"] = exc.validation
+            if exc.recoverable_paths:
+                result["recoverable_paths"] = exc.recoverable_paths
+            return result
         except ParamError as exc:
             return self._fail(tone, seed_value, exc, None, started, exc.code)
         except Exception as exc:
@@ -502,12 +613,12 @@ class Flash:
         if audio_in is not None:
             raise ParamError("UNSUPPORTED_INPUT", f"{spec['name']} does not accept audio_in")
 
-        images = []
+        images, input_artifacts = [], []
         image_size = None
         if image_in is not None:
             if "image_in" not in accepted:
                 raise ParamError("UNSUPPORTED_INPUT", f"{spec['name']} does not accept image_in")
-            images = _normalize_images(image_in, inputs["fields"]["image_in"])
+            images, input_artifacts = _normalize_images(image_in, inputs["fields"]["image_in"])
             for path in images:
                 try:
                     size = media.image_size(path)
@@ -543,12 +654,16 @@ class Flash:
 
         advanced = dict(advanced)
         timing = contracts.resolve_time(spec, duration, advanced.pop("fps", None))
+        delivery = contracts.resolve_delivery(spec, advanced)
+        for destination in artifact.output_paths(out_path, spec["output"]).values():
+            if destination.is_dir() or delivery["overwrite"] and destination.is_symlink():
+                raise ParamError("BAD_OUTPUT", f"Output destination cannot be replaced: {destination}")
+            if not delivery["overwrite"] and (destination.exists() or destination.is_symlink()):
+                raise ParamError("OUTPUT_EXISTS", f"Output already exists: {destination}; set overwrite=true to replace it")
         if seed is None:
             seed_value = random.SystemRandom().randrange(0, 2 ** 31)
         else:
-            if isinstance(seed, bool) or not isinstance(seed, int):
-                raise ParamError("BAD_SEED", f"seed must be an integer: {seed!r}")
-            seed_value = seed % (2 ** 63)
+            seed_value = contracts.scalar_value("seed", seed, controls.get("seed", {"type": "integer"}), "BAD_SEED") % (2 ** 63)
 
         decl = controls["resolution"]
         res_value = decl["default"] if resolution is None else resolution
@@ -556,8 +671,8 @@ class Flash:
         width, height = contracts.resolve_canvas(spec, res_value, image_size)
         params = contracts.resolve_advanced(spec, advanced)
         return {
-            "prompt": prompt, "images": images, "output": str(out_path),
+            "prompt": prompt, "images": images, "input_artifacts": input_artifacts, "output": str(out_path),
             "width": width, "height": height, "frames": timing.get("aligned_frame_count"),
             "duration": timing.get("requested_duration_s"), "seed": seed_value,
-            "resolution": res_value, "advanced": params, **timing,
+            "resolution": res_value, "advanced": params, **timing, **delivery,
         }

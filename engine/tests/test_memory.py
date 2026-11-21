@@ -1,6 +1,7 @@
 import argparse
 from contextlib import nullcontext
 import json
+import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -8,10 +9,17 @@ from unittest.mock import Mock, patch
 
 from engine import Flash, agent, setup_checks
 from engine.bank import TONES
-from engine.runtime import Runtime
+from engine.runtime import Runtime, _pin_device
 
 
 class MemoryTests(unittest.TestCase):
+    def test_pin_respects_visible_ordinals_and_worker_mask(self):
+        with patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "GPU-alpha,GPU-bravo"}):
+            _pin_device("cuda:1")
+            self.assertEqual(os.environ["CUDA_VISIBLE_DEVICES"], "GPU-bravo")
+            _pin_device("cuda:1")
+            self.assertEqual(os.environ["CUDA_VISIBLE_DEVICES"], "GPU-bravo")
+
     def test_scheduler_uses_physical_free_memory_of_the_matching_gpu(self):
         devices = [
             {"index": 0, "uuid": "b", "total_mib": 16300, "free_mib": 15172, "ready": True},
@@ -129,7 +137,7 @@ class MemoryTests(unittest.TestCase):
             self.assertEqual(run.call_count, 2)
             self.assertEqual(run.call_args.args[1:], ([(1, paths[1]), (2, paths[2])], 0))
             self.assertEqual(run.call_args.kwargs, {"safe_memory": True})
-        self.assertEqual(result["results"], [success, success, success])
+        self.assertEqual(result["results"], [dict(success, request_index=i, request_id=i) for i in range(3)])
         self.assertEqual(result["serial_retries"], 2)
 
     def test_windows_batch_defaults_to_unpinned_host_memory_and_respects_explicit_override(self):
@@ -159,9 +167,9 @@ class MemoryTests(unittest.TestCase):
             paths = [root / f"{i}.json" for i in range(3)]
             for i, path in enumerate(paths):
                 agent.write_text(path, agent.json_text({"output": str(root / f"{i}.mp4")}))
-            hardware = {"active_devices": [0, 1], "gpus": [
+            hardware = {"active_devices": [0, 1], "free_ram_mib": 45000, "gpus": [
                 {"index": 0, "free_mib": 15000, "total_mib": 16000, "ready": True},
-                {"index": 1, "free_mib": 14000, "total_mib": 16000, "ready": True},
+                {"index": 1, "free_mib": 14800, "total_mib": 16000, "ready": True},
             ]}
             def worker(args, requests, index, *, safe_memory=False):
                 self.assertFalse(safe_memory)
@@ -176,5 +184,6 @@ class MemoryTests(unittest.TestCase):
             ) as run:
                 result = agent.play(argparse.Namespace(config=config, request=paths))
             self.assertEqual(run.call_count, 3)
-        self.assertEqual(result["results"], [finished, recovered, invalid])
+        self.assertEqual(result["results"], [dict(row, request_index=i, request_id=i)
+                                             for i, row in enumerate((finished, recovered, invalid))])
         self.assertEqual(result["serial_retries"], 1)

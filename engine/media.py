@@ -1,9 +1,4 @@
-"""engine.media —— 只做"把人给的文件读进来、把结果写出去"，不含任何生成逻辑。
-
-图片走 Pillow，视频走 PyAV（H.264 + AAC）。
-中间不落任何临时文件；若容器封装需要缓冲，只在内存里做。
-"""
-
+"""Pillow/PyAV image and H.264/AAC codec primitives used by Artifact delivery."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -13,7 +8,7 @@ VIDEO_EXT = {".mp4", ".mov", ".mkv"}
 
 
 def load_image(rt, path: str):
-    """读一张图 -> [1,H,W,3] float32 0..1（已按 EXIF 转正）。"""
+    """Read an EXIF-oriented image into a [1,H,W,3] float32 tensor."""
     import numpy as np
     from PIL import Image, ImageOps
 
@@ -27,37 +22,73 @@ def image_size(path: str):
     from PIL import Image, ImageOps
 
     with Image.open(path) as img:
-        w, h = ImageOps.exif_transpose(img).size
-    return w, h
+        return ImageOps.exif_transpose(img).size
+
+
+def _finite_array(value):
+    import numpy as np
+
+    if hasattr(value, "detach"):
+        value = value.detach().float().cpu().numpy()
+    arr = np.asarray(value, dtype=np.float32)
+    if not np.isfinite(arr).all():
+        raise ValueError("Generated samples contain NaN or Inf")
+    return arr
+
+
+def _rgb8(frame):
+    import numpy as np
+
+    arr = _finite_array(frame)
+    if arr.ndim != 3 or arr.shape[2] != 3 or min(arr.shape[:2]) < 1:
+        raise ValueError(f"Expected a nonempty RGB frame, received {arr.shape}")
+    return (np.clip(arr, 0, 1) * 255.0).round().astype("uint8")
 
 
 def save_image(tensor, path: str) -> str:
-    """[H,W,C] 或 [1,H,W,C] 0..1 -> 磁盘图片。"""
-    import numpy as np
+    """Encode one RGB tensor [H,W,3] or [1,H,W,3]."""
     from PIL import Image
 
-    arr = tensor
-    if getattr(arr, "dim", lambda: 0)() == 4:
-        arr = arr[0]
-    arr = arr.detach().float().clamp(0, 1).cpu().numpy()
-    arr = (arr * 255.0).round().astype("uint8")
+    if len(tensor.shape) == 4:
+        if tensor.shape[0] != 1:
+            raise ValueError(f"Expected one generated image, received {tensor.shape[0]}")
+        tensor = tensor[0]
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
-    Image.fromarray(arr).save(str(out))
+    Image.fromarray(_rgb8(tensor)).save(str(out))
     return str(out)
 
 
-def save_video(frames, path: str, fps: int = 24, audio=None) -> str:
-    """frames [T,H,W,C] 0..1 + audio {'waveform':[B,C,L], 'sample_rate':int} -> mp4/mov/mkv。"""
+def _audio_for_encode(audio, total, fps):
+    import numpy as np
+
+    sr = int(audio.get("sample_rate") or 32000)
+    if sr <= 0:
+        raise ValueError(f"Invalid audio sample rate {sr}")
+    wav = _finite_array(audio["waveform"])
+    if wav.ndim == 3:
+        wav = wav[0]
+    if wav.ndim != 2 or min(wav.shape) == 0:
+        raise ValueError(f"Expected nonempty [channels,samples] waveform, received {wav.shape}")
+    if wav.shape[0] == 1:
+        wav = np.repeat(wav, 2, axis=0)
+    limit = int(round(total / fps * sr))
+    wav = wav[:2, :limit]
+    if wav.shape[1] < limit:
+        wav = np.pad(wav, ((0, 0), (0, limit - wav.shape[1])))
+    return wav, sr
+
+
+def save_video(frames, path: str, fps: int = 24, audio=None, *, on_frame=None, on_audio=None) -> str:
+    """Encode [T,H,W,3]; optional inspection callbacks see the exact encoder inputs."""
     import av
     import numpy as np
 
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
-
-    total = int(frames.shape[0])
-    height = int(frames.shape[1])
-    width = int(frames.shape[2])
+    if len(frames.shape) != 4 or min(frames.shape[:3]) < 1 or frames.shape[3] != 3 or fps <= 0:
+        raise ValueError(f"Invalid video dimensions/frame rate: {frames.shape}, {fps} fps")
+    total, height, width, _ = map(int, frames.shape)
 
     with av.open(str(out), mode="w") as container:
         vstream = container.add_stream("libx264", rate=fps)
@@ -66,29 +97,15 @@ def save_video(frames, path: str, fps: int = 24, audio=None) -> str:
         vstream.pix_fmt = "yuv420p"
         vstream.options = {"crf": "17", "preset": "medium"}
 
-        astream = None
         if audio is not None and audio.get("waveform") is not None:
-            sr = int(audio.get("sample_rate") or 32000)
-            wav = audio["waveform"]
-            wav = wav.detach().float().cpu().numpy() if hasattr(wav, "detach") else np.asarray(wav, "float32")
-            wav = wav[0] if wav.ndim == 3 else wav
-            if wav.shape[0] == 1:
-                wav = np.repeat(wav, 2, axis=0)
-            wav = wav[:2]
-            limit = int(round(total / fps * sr))
-            if wav.shape[1] > limit:
-                wav = wav[:, :limit]
-            else:
-                wav = np.pad(wav, ((0, 0), (0, limit - wav.shape[1])))
-
+            wav, sr = _audio_for_encode(audio, total, fps)
+            if on_audio:
+                on_audio(wav, sr)
             astream = container.add_stream("aac", rate=sr)
             astream.layout = "stereo"
-
             pcm = (np.clip(wav.T, -1.0, 1.0) * 32767.0).astype("<i2")
             for start in range(0, pcm.shape[0], 1024):
                 block = np.ascontiguousarray(pcm[start:start + 1024])
-                if block.shape[0] == 0:
-                    continue
                 aframe = av.AudioFrame(format="s16", layout="stereo", samples=block.shape[0])
                 aframe.sample_rate = sr
                 aframe.pts = start
@@ -99,12 +116,12 @@ def save_video(frames, path: str, fps: int = 24, audio=None) -> str:
                 container.mux(packet)
 
         for i in range(total):
-            arr = frames[i].detach().float().clamp(0, 1).cpu().numpy()
-            arr = (arr * 255.0).round().astype("uint8")
+            arr = _rgb8(frames[i])
+            if on_frame:
+                on_frame(i, arr)
             vframe = av.VideoFrame.from_ndarray(arr, format="rgb24")
             for packet in vstream.encode(vframe):
                 container.mux(packet)
         for packet in vstream.encode():
             container.mux(packet)
-
     return str(out)

@@ -11,16 +11,21 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import time
 from tempfile import NamedTemporaryFile
 
 ROOT = Path(__file__).resolve().parents[1]
 if not __package__:
     sys.path.insert(0, str(ROOT))
 
-from engine import Flash
+from engine import Flash, media, telemetry
+from engine.artifact import output_paths
+from engine.bank import TONES
 from engine.core import DEFAULT_CONFIG, ParamError, load_config
+from engine.device_profile import build_device_profiles, decide_device, nvidia_telemetry
 from engine.setup_checks import (
-    ARTIFACTS, INSTALL_GUIDE, MODEL_LICENSES, choose_python, download_space, download_weight,
+    ARTIFACTS, BATCH_FREE_RAM_MIB, BATCH_FREE_VRAM_MIB, INSTALL_GUIDE, MODEL_LICENSES,
+    choose_python, download_space, download_weight,
     hardware_report, model_issue, probe_python,
 )
 
@@ -237,7 +242,13 @@ def register(args):
         not runtime["ready"] or not any(gpu["ready"] for gpu in runtime["gpus"])
     ):
         runtime = choose_python(comfy, None)
-    hardware = hardware_report(runtime, settings.get("device"), inventory=True)
+    if getattr(args, "auto_schedule", False):
+        settings["auto_schedule"] = True
+    hardware = hardware_report(runtime, settings.get("device"), inventory=True,
+                               allow_parallel=settings.get("auto_schedule") is True)
+    if hardware["device"] and settings.get("auto_schedule") is not True:
+        pin = settings.get("device", f"cuda:{hardware['device']['index']}")
+        hardware["summary"] += f" 当前配置固定使用 {pin}。"
     environment_ready = bool(comfy and runtime["ready"] and hardware["device"])
     for item in functions:
         item["models_ready"] = item["ready"]
@@ -269,7 +280,8 @@ def register(args):
         return result
 
     python = runtime["path"]
-    settings.update(python=python, device=f"cuda:{hardware['device']['index']}")
+    settings["python"] = python
+    settings.setdefault("device", f"cuda:{hardware['device']['index']}")
     verified = hardware["device"].get("video_acceleration", {})
     video_acceleration = {}
     for option in ("sage_attention", "fp16_accumulation"):
@@ -334,15 +346,43 @@ def device_mask(index, inherited):
     return tokens[index].strip()
 
 
+def request_path(value):
+    if not isinstance(value, str) or not value or "\0" in value:
+        return None
+    try:
+        return Path(value).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def output_bundle(path):
+    return output_paths(path, "video" if path.suffix.lower() in media.VIDEO_EXT else "image").values()
+
+
+def reference_paths(request):
+    value = request.get("image_in")
+    for reference in value if isinstance(value, list) else (value,):
+        path = reference.get("path") if isinstance(reference, dict) else reference
+        if resolved := request_path(path):
+            yield resolved
+
+
 def render_requests(config, requests, report=None):
-    with Flash(config=config) as flash:
+    with Flash(config=config, _persist_history=False) as flash:
         results = []
+        failed_outputs = set()
         for position, request in enumerate(requests):
-            try:
-                result = flash.play(**request)
-            except TypeError as exc:
-                result = {"ok": False, "error": {"code": "BAD_REQUEST", "message": str(exc)}}
+            missing = next((path for path in reference_paths(request) if path in failed_outputs), None)
+            if missing is not None:
+                result = {"ok": False, "error": {"code": "DEPENDENCY_FAILED", "message": f"Input failed: {missing}"}}
+            else:
+                try:
+                    result = flash.play(**request)
+                except TypeError as exc:
+                    result = {"ok": False, "error": {"code": "BAD_REQUEST", "message": str(exc)}}
             results.append(result)
+            if not result["ok"] and (output := request_path(request.get("output"))) is not None:
+                failed_outputs.update(output_bundle(output))
             if report:
                 report(position, result)
                 if host_buffer_error(result.get("error", {}).get("message", "")):
@@ -405,14 +445,132 @@ def worker_results(args, requests, index, *, safe_memory=False):
             for (position, _), result in zip(requests, results)]
 
 
-def most_free_device(hardware):
-    usable = (gpu for gpu in hardware["gpus"] if gpu["ready"])
-    return max(usable, key=lambda gpu: (gpu["free_mib"], gpu["total_mib"]), default=None)
+def schedule(config, hardware, profiles, count, dependent=False):
+    configured = config.get("device", "cuda:0")
+    inherited = os.getenv("CUDA_VISIBLE_DEVICES", "")
+    preferred = "cuda:0" if inherited.strip() and "," not in inherited else configured
+    requested_auto = config.get("auto_schedule") is True
+    if "device" in config and not requested_auto:
+        decision = decide_device(profiles, preferred=preferred)
+        if preferred != configured:
+            decision["configured_device"] = configured
+            if decision["selected_device"]:
+                decision["decision_reason"] = "inherited_single_device"
+        return [decision], 0
+
+    active = hardware.get("active_devices", [])
+    seats, delay = admit_workers(min(count, len(active)), hardware.get("free_ram_mib"))
+    if seats > 1 and not dependent:
+        decisions = []
+        remaining = set(active)
+        for _ in range(seats):
+            decision = decide_device(profiles, preferred=preferred, auto_schedule=True, candidate_indices=remaining,
+                                     min_free_vram_mib=BATCH_FREE_VRAM_MIB, min_free_ram_mib=BATCH_FREE_RAM_MIB)
+            selected = decision["selected_device"]
+            if selected is None:
+                break
+            decisions.append(decision)
+            remaining.remove(int(selected.split(":")[1]))
+        if len(decisions) > 1:
+            return decisions, delay
+
+    thresholds = {"min_free_vram_mib": BATCH_FREE_VRAM_MIB, "min_free_ram_mib": BATCH_FREE_RAM_MIB} if requested_auto else {}
+    single = decide_device(profiles, preferred=preferred, auto_schedule=True, **thresholds)
+    if single["selected_device"] is not None and count > 1:
+        single.update(decision_reason="dependency_order" if dependent else "parallel_resources_unavailable",
+                      fallback_used=True)
+    return [single], 0
+
+
+def attempt_record(request, result, index, number, profiles, inventory, initial=None):
+    record = result.get("telemetry") or telemetry.worker_attempt(request, result)
+    identifier = request.get("request_id")
+    record["request_id"] = telemetry.request_identifier(identifier) or index
+    record["attempt_index"] = number
+    record["recovered_by_retry"] = bool(number and result["ok"])
+    record["retry_of"] = initial["attempt_id"] if initial is not None else None
+    info = record["device_info"]
+    actual = str(info.get("uuid") or "").lower().removeprefix("gpu-")
+    reported = result.get("device")
+    profile = next((item for item in profiles if item["device"] == reported), {})
+    sample = next((item for item in inventory if actual and item["uuid"].lower().removeprefix("gpu-") == actual), {})
+    if sample:
+        info.update(uuid=sample["uuid"], driver_version=sample.get("driver_version"),
+                    admission_gpu_utilization_pct=profile.get("utilization_pct"))
+    elif not actual and profile.get("uuid"):
+        info.update(uuid=profile["uuid"], name=profile["name"], driver_version=profile["driver_version"],
+                    assignment_only=True)
+    if info.get("uuid"):
+        stable = {key: info.get(key) for key in ("uuid", "name", "driver_version", "compute_capability",
+                                                "total_vram_bytes", "comfyui", "torch", "cuda")}
+        record["device_fingerprint"] = telemetry.fingerprint(stable)
+    return record
+
+
+def finish_cli(result, config, records, requests, rows):
+    path, warnings = telemetry.persist(config, records)
+    for request, row in zip(requests, rows):
+        if path and not request.get("verbose") and isinstance(row.get("telemetry"), dict):
+            record = row["telemetry"]
+            row["telemetry"] = {key: record[key] for key in ("attempt_id", "status", "failure_stage")}
+    return telemetry.add_receipt(result, path, warnings)
 
 
 def batch_result(results, devices):
     return {"ok": all(result["ok"] for result in results), "parallel": len(devices) > 1,
             "devices": [f"cuda:{index}" for index in devices], "results": results}
+
+
+def identified_results(requests, results):
+    rows = []
+    for position, (request, result) in enumerate(zip(requests, results)):
+        identifier = request.get("request_id")
+        rows.append({**result, "request_index": position,
+                     "request_id": identifier if isinstance(identifier, str) and identifier.strip() else position})
+    return rows
+
+
+def batch_layout(requests, workers):
+    """Favor model reuse only for similar work, so a heavy queue does not strand another GPU."""
+    order = [list(range(slot, len(requests), workers)) for slot in range(workers)]
+    if workers == 1:
+        return order
+    groups = {}
+    workloads = set()
+    for position, request in enumerate(requests):
+        tone = TONES.get(str(request.get("tone")))
+        if tone is None:
+            return order
+        spec = tone.TONE
+        controls = spec["controls"]
+        resolution = request.get("resolution") or controls["resolution"]["default"]
+        duration = request.get("duration") or controls.get("duration", {}).get("default")
+        if str(resolution).lower() == "match":
+            return order
+        workloads.add((spec["output"], str(resolution), str(duration)))
+        if len(workloads) > 1:
+            return order
+        fingerprint = (spec["id"], tuple(sorted(spec.get("models", {}).items())),
+                       str(request.get("lora_strength", spec.get("advanced", {}).get("lora_strength", {}).get("default"))))
+        groups.setdefault(fingerprint, []).append(position)
+    grouped = [index for group in sorted(groups.values(), key=len, reverse=True) for index in group]
+    queues = []
+    offset = 0
+    for queue in order:
+        end = offset + len(queue)
+        queues.append(grouped[offset:end])
+        offset = end
+    return queues
+
+
+def admit_workers(available, free_ram_mib):
+    """Use a conservative per-worker host budget, with staggered starts near the limit."""
+    if available < 2 or free_ram_mib is None:
+        return available, 0
+    budget_mib = 12 * 1024
+    workers = min(available, max(1, free_ram_mib // budget_mib))
+    delay_s = 5 if workers > 1 and free_ram_mib < workers * 18 * 1024 else 0
+    return workers, delay_s
 
 
 def play(args):
@@ -427,32 +585,70 @@ def play(args):
             config.setdefault("disable_pinned_memory", True)
         results = render_requests(config, requests, report_worker_result)
         return batch_result(results, [])
-    if len(requests) == 1:
-        device = load_config(args.config).get("device", "cuda:0")
-        inherited = os.getenv("CUDA_VISIBLE_DEVICES")
-        if device.startswith("cuda:") and inherited and "," in inherited:
-            os.environ["CUDA_VISIBLE_DEVICES"] = device_mask(int(device.split(":")[1]), inherited)
-        return render_requests(args.config, requests)[0]
-    outputs = [Path(request["output"]).expanduser().resolve() for request in requests if request.get("output")]
-    if len(outputs) != len(requests) or len(set(outputs)) != len(outputs):
-        raise ValueError("批量请求必须各有一个不同的 output 路径。")
+    has_dependencies = False
+    if len(requests) > 1:
+        outputs = [request_path(request.get("output")) for request in requests]
+        if any(output is None for output in outputs) or len(set(outputs)) != len(outputs):
+            raise ValueError("批量请求必须各有一个不同的 output 路径。")
+        reserved = [(path, position) for position, output in enumerate(outputs) for path in output_bundle(output)]
+        producers = dict(reserved)
+        if len(reserved) != len(producers):
+            raise ValueError("批量输出路径与另一个请求的媒体旁车冲突。")
+        explicit_ids = [value for request in requests if isinstance(value := request.get("request_id"), str) and value.strip()]
+        if len(explicit_ids) != len(set(explicit_ids)):
+            raise ValueError("同一批次的 request_id 必须唯一。")
+        links = [(position, producers[path]) for position, request in enumerate(requests)
+                 for path in reference_paths(request) if path in producers and producers[path] != position]
+        if any(consumer < producer for consumer, producer in links):
+            raise ValueError("批量请求请先生成依赖素材，再提交使用该素材的请求。")
+        has_dependencies = bool(links)
     cfg = load_config(args.config)
     preferred = cfg.get("device", "cuda:0")
+    # Keep the launcher's existing CUDA mask and direct path unless auto selection was requested.
+    if len(requests) == 1 and (cfg.get("auto_schedule") is not True or preferred == "cpu"):
+        inherited = os.getenv("CUDA_VISIBLE_DEVICES")
+        if preferred.startswith("cuda:") and inherited and "," in inherited:
+            os.environ["CUDA_VISIBLE_DEVICES"] = device_mask(int(preferred.split(":")[1]), inherited)
+        result = render_requests(cfg, requests)[0]
+        inventory = nvidia_telemetry() if result.get("telemetry", {}).get("device_info", {}).get("uuid") else []
+        record = attempt_record(requests[0], result, None, 0, [], inventory)
+        record["device_selection"] = {"decision_reason": "configured_device", "selected_device": preferred}
+        return finish_cli(result, cfg, [record], requests, [result])
     if preferred == "cpu":
-        return batch_result(render_requests(args.config, requests), [])
+        results = render_requests(cfg, requests)
+        records = [attempt_record(request, result, i, 0, [], [])
+                   for i, (request, result) in enumerate(zip(requests, results))]
+        batch = batch_result(identified_results(requests, results), [])
+        for record in records:
+            record["device_selection"] = {"decision_reason": "configured_device", "selected_device": preferred}
+        return finish_cli(batch, cfg, records, requests, batch["results"])
     hardware = hardware_report(probe_python(sys.executable, hardware_only=True), preferred)
-    devices = hardware["active_devices"]
-    if len(devices) < 2:
-        best = most_free_device(hardware)
-        if best is None:
-            raise ValueError(hardware["summary"])
-        devices = [best["index"]]
-    devices = devices[:len(requests)]
-    indexed = list(enumerate(paths))
+    inventory = nvidia_telemetry()
+    profiles = build_device_profiles(hardware, inventory=inventory)
+    decisions, delay_s = schedule(cfg, hardware, profiles, len(requests), has_dependencies)
+    devices = [int(d["selected_device"].split(":")[1]) for d in decisions if d["selected_device"]]
+    if not devices:
+        blocked = {"ok": False, "error": {"code": "DEVICE_UNAVAILABLE", "message": hardware.get("summary", "No CUDA device")}}
+        results = [blocked.copy() for _ in requests]
+        batch = batch_result(identified_results(requests, results), []) if len(requests) > 1 else results[0]
+        batch.update(scheduling=decisions, device_profiles=profiles)
+        records = [attempt_record(request, result, position, 0, profiles, inventory)
+                   for position, (request, result) in enumerate(zip(requests, results))]
+        for record in records:
+            record["device_selection"] = decisions[0]
+        return finish_cli(batch, cfg, records, requests, batch.get("results", results))
+    queues = batch_layout(requests, len(devices))
     with ThreadPoolExecutor(max_workers=len(devices)) as executor:
-        workers = [executor.submit(worker_results, args, indexed[slot::len(devices)], index)
-                   for slot, index in enumerate(devices)]
+        workers = []
+        for slot, (queue, index) in enumerate(zip(queues, devices)):
+            if slot and delay_s:
+                time.sleep(delay_s)
+            workers.append(executor.submit(worker_results, args, [(position, paths[position]) for position in queue], index))
         finished = dict(item for worker in workers for item in worker.result())
+    records = {i: [attempt_record(requests[i], row, i, 0, profiles, inventory)] for i, row in finished.items()}
+    by_device = {decision["selected_device"]: decision for decision in decisions}
+    for position, row in finished.items():
+        records[position][0]["device_selection"] = by_device.get(row.get("device"))
     serial_retries = 0
     safe_memory = False
     retry = []
@@ -466,14 +662,26 @@ def play(args):
             retry.append((position, paths[position]))
     if retry:
         refreshed = hardware_report(probe_python(sys.executable, hardware_only=True), preferred)
-        available = most_free_device(refreshed)
-        if available is not None:
-            finished.update(worker_results(args, sorted(retry), available["index"], safe_memory=safe_memory))
-            serial_retries = len(retry)
-    result = batch_result([finished[position] for position in range(len(paths))], devices)
+        retry_inventory = nvidia_telemetry()
+        retry_profiles = build_device_profiles(refreshed, inventory=retry_inventory)
+        retry_decisions, _ = schedule(cfg, refreshed, retry_profiles, 1)
+        if selected := retry_decisions[0]["selected_device"]:
+            decisions.append({**retry_decisions[0], "serial_retry": True})
+            for position, recovered in worker_results(args, sorted(retry), int(selected.split(":")[1]), safe_memory=safe_memory):
+                first = records[position][0]
+                record = attempt_record(requests[position], recovered, position, 1, retry_profiles,
+                                        retry_inventory, initial=first)
+                record["device_selection"] = decisions[-1]
+                records[position].append(record)
+                finished[position] = recovered
+                serial_retries += 1
+    rows = [finished[position] for position in range(len(paths))]
+    result = batch_result(identified_results(requests, rows), devices) if len(requests) > 1 else rows[0]
+    result.update(scheduling=decisions, device_profiles=profiles)
     if serial_retries:
         result["serial_retries"] = serial_retries
-    return result
+    history = [record for i in range(len(paths)) for record in records[i]]
+    return finish_cli(result, cfg, history, requests, result.get("results", rows))
 
 
 def main():
@@ -486,6 +694,7 @@ def main():
     setup.add_argument("--python", help="推理 Python 的路径")
     setup.add_argument("--comfyui-root", help="设置本机 ComfyUI 目录")
     setup.add_argument("--models-path", help="设置本机模型总目录")
+    setup.add_argument("--auto-schedule", action="store_true", help="允许 CLI 按当前资源自动选择 GPU")
     setup.set_defaults(handler=register)
     download = actions.add_parser("download-models", help="得到用户确认后补齐官方权重")
     download.add_argument("--yes", action="store_true", help="表示用户已经确认下载")

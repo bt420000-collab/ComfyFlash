@@ -10,10 +10,10 @@ def h3_tone(spec, *, capability, image_role=None):
     controls["prompt"].update(type="string", pattern=r"\S")
     if image_role:
         fields["image_in"] = {
-            "type": "path_or_list", "role": image_role, "media_type": "image",
+            "type": "path_artifact_or_list", "role": image_role, "media_type": "image",
             "required": True, "min_items": 1, "max_items": 1,
         }
-        controls["image_in"]["type"] = "path_or_list"
+        controls["image_in"]["type"] = "path_artifact_or_list"
     spec["inputs"]["fields"] = fields
     controls["seed"]["type"] = "integer"
     canvas = controls["resolution"]

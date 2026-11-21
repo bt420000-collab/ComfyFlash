@@ -40,7 +40,7 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(info["inputs"]["fields"]["image_in"]["role"], "reference_image")
         schema = info["schema"]
         self.assertTrue({"tone","prompt","output","image_in"} <= set(schema["required"]))
-        self.assertEqual(schema["properties"]["fps"]["const"], 24)
+        self.assertEqual(schema["properties"]["fps"]["enum"], [24, None])
         self.assertIn(".mp4", info["outputs"]["formats"])
         for dep in info["models"]:
             p = Path(dep["path"])
@@ -113,7 +113,9 @@ class ContractTests(unittest.TestCase):
             ({"scheduler":"pika","sampler":"euler"}, False), ({"scheduler":"pika","steps":4}, False),
             ({"steps":18,"cfg":5,"sampler":"euler"}, True), ({"steps":3}, False), ({"cfg":0.9}, False),
             ({"sampler":"lcm","cfg":2}, True), ({"fps":25}, False), ({"unknown":1}, False),
-            ({"duration":0.9},False), ({"steps":False}, False),
+            ({"duration":0.9},False), ({"steps":False}, False), ({"fps":None}, True),
+            ({"seed":6.0}, True), ({"seed":6.5}, False), ({"resolution":"typo"}, False),
+            ({"resolution":" 768X448 "}, True),
         ]:
             with self.subTest(knobs=knobs):
                 self.assertEqual(validator.is_valid({**request, **knobs}), valid)
@@ -183,7 +185,9 @@ class ContractTests(unittest.TestCase):
                 runtime.decode.return_value = np.zeros((count,1,1,3)).view(Frames)
                 run = _Run(self.flash, self.flash._spec("t1"), self.resolve(duration=5))
                 frames = run.decode_frames(None, {"samples": None})
-                with patch("engine.media.save_video", return_value="out.mp4"):
+                with patch.object(run, "_artifact_details", return_value={}), patch(
+                    "engine.artifact.deliver_video", return_value={"path": "out.mp4", "timing_s": {"encoding": 0.1}}
+                ):
                     run.save_video(frames)
                 meta = run.meta
                 self.assertEqual((meta.get("requested_duration_s"), meta.get("requested_frame_count")), (5,120))

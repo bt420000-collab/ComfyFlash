@@ -8,6 +8,8 @@
 
 ComfyFlash turns proven model-inference recipes into **discoverable, directly callable capabilities**. Instead of building node-based workflows or keeping a web server running, an agent can inspect the available capabilities, supply inputs and parameters, and generate media locally.
 
+The v0.2 development branch adds capability discovery, preflight validation, media inspection, and local RSI history. See [the API guide](docs/CF_V02_API.md), [RSI storage](docs/CF_V02_RSI_STORAGE.md), and [the test report](docs/CF_V02_TEST_REPORT.md) in Simplified Chinese.
+
 ## Why ComfyFlash?
 
 Long-running agent tasks, such as video production and batch image generation, may repeatedly submit jobs to the ComfyUI API, poll for progress, inspect logs, and retrieve results. Those additional agent-tool interactions consume context and tokens. Service forwarding, queues, and orchestration layers can also introduce waiting time.

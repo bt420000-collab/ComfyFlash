@@ -63,6 +63,7 @@ def play(run):
     prompt = run.prompt
     if "<Picture" not in prompt:
         prompt = str(run.params.get("prompt_prefix") or "") + prompt
+    run.prompt = prompt
 
     images = [media.load_image(rt, run.image_paths[0])]
 

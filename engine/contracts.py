@@ -53,6 +53,40 @@ def scalar_value(key, value, decl, code="BAD_PARAM"):
     return value
 
 
+def delivery_controls(spec):
+    declarations = {
+        "overwrite": {"type": "boolean", "default": False, "note": "Replace an existing output with permission."},
+        "request_id": {"type": "string", "pattern": r"\S", "note": "Optional caller-supplied request identifier."},
+    }
+    if spec["output"] == "video":
+        declarations["inspection_frames"] = {"type": "integer", "default": 6, "min": 1, "max": 24,
+                                              "note": "Number of samples for the contact sheet."}
+    return declarations
+
+
+def resolve_delivery(spec, provided):
+    resolved = {}
+    for key, decl in delivery_controls(spec).items():
+        if key in provided or "default" in decl:
+            resolved[key] = scalar_value(key, provided.pop(key, decl.get("default")), decl)
+    return resolved
+
+
+def canvas_pattern(decl):
+    def case_insensitive(name):
+        return "".join(f"[{letter.lower()}{letter.upper()}]" if letter.isascii() and letter.isalpha()
+                       else re.escape(letter) for letter in name)
+
+    names = list(decl.get("sizes", {}))
+    if "match_short_edge" in decl:
+        names.append("match")
+    valid = [case_insensitive(name) for name in names]
+    valid.append(r"\d+\s*[xX×*]\s*\d+")
+    whitespace = r"\s*(?:" + "|".join(valid) + r")\s*"
+    pattern = f"(?:{whitespace}|)" if "empty_alias" in decl else whitespace
+    return "^" + pattern + r"$(?![\s\S])"
+
+
 def request_schema(spec):
     """Canonical JSON request. x-* rules describe host filesystem and normalization."""
     inputs = spec["inputs"]
@@ -60,28 +94,35 @@ def request_schema(spec):
              "seed": {"type": ["integer", "null"], "default": None},
              "output": {"type": "string", "minLength": 1, "x-path": "absolute-output",
                         "x-extensions": spec["outputs"]["formats"]},
-             "verbose": {"type": ["boolean", "null"]}}
-    for key, decl in {**spec.get("controls", {}), **spec.get("advanced", {})}.items():
+             "verbose": {"type": ["boolean", "null"]}, "audio_in": {"type": "null"}}
+    if "image_in" not in inputs.get("fields", {}):
+        props["image_in"] = {"type": "null"}
+    for key, decl in {**spec.get("controls", {}), **spec.get("advanced", {}), **delivery_controls(spec)}.items():
         if key == "image_in":
             field = inputs["fields"][key]
             path = {"type": "string", "minLength": 1, "x-path": "absolute-readable-image"}
-            forms = [{"type": "array", "items": path, "minItems": field["min_items"], "maxItems": field["max_items"]}]
+            image = {"oneOf": [path, {"type": "object", "required": ["media_type", "path"],
+                                     "properties": {"media_type": {"const": "image"}, "path": path}}]}
+            forms = [{"type": "array", "items": image, "minItems": field["min_items"], "maxItems": field["max_items"]}]
             if field["min_items"] <= 1 <= field["max_items"]:
-                forms.insert(0, path)
+                forms.insert(0, image)
             props[key] = {"oneOf": forms, "x-role": field["role"]}
         else:
             prop = scalar_schema(decl)
             if key in ("resolution", "duration", "seed"):
                 prop["type"] = [decl["type"], "null"]
             if key == "resolution":
+                prop["pattern"] = canvas_pattern(decl)
                 prop["x-canvas"] = {k:v for k,v in decl.items() if k not in ("type","default")}
             props[key] = prop
     schema = {"$schema": "https://json-schema.org/draft/2020-12/schema",
               "type": "object", "properties": props, "additionalProperties": False,
               "required": ["tone", *inputs["required"], "output"]}
     if "temporal" in spec:
-        props["fps"] = {"type": "number", "const": spec["temporal"]["fps"]}
+        props["fps"] = {"type": ["number", "null"], "enum": [spec["temporal"]["fps"], None]}
         schema["x-temporal"] = spec["temporal"]
+    else:
+        props.update(duration={"type": "null"}, fps={"type": "null"})
     if "sampling_policy" in spec:
         policy = spec["sampling_policy"]
         preset = spec["presets"][policy["default_preset"]]

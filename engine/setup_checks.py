@@ -115,15 +115,16 @@ with contextlib.redirect_stdout(sys.stderr):
             try:
                 with torch.cuda.device(index):
                     free, total = torch.cuda.mem_get_info()
+                    capability = torch.cuda.get_device_capability(index)
                     gpu.update(name=torch.cuda.get_device_name(), total_mib=total // 2**20,
-                               free_mib=free // 2**20)
+                               free_mib=free // 2**20, compute_capability=capability)
                     uuid = getattr(torch.cuda.get_device_properties(index), "uuid", None)
                     if uuid is not None:
                         gpu["uuid"] = str(uuid)
                     value = torch.ones(2, device="cuda", dtype=torch.bfloat16)
                     (value + value).sum().item()
                     gpu["ready"] = True
-                    if root and torch.cuda.get_device_capability(index)[0] >= 8:
+                    if root and capability[0] >= 8:
                         gpu["video_acceleration"] = probe_video_acceleration(torch, gpu)
             except Exception as exc:
                 gpu["error"] = str(exc)
@@ -208,7 +209,7 @@ def nvidia_inventory():
         return []
 
 
-def hardware_report(runtime, preferred=None, *, inventory=False):
+def hardware_report(runtime, preferred=None, *, inventory=False, allow_parallel=True):
     cuda_gpus = runtime.get("gpus", [])
     detected = nvidia_inventory() if inventory or cuda_gpus else []
     physical_free = {
@@ -245,8 +246,10 @@ def hardware_report(runtime, preferred=None, *, inventory=False):
     count = max(len(gpus), len(detected))
     if count > 1:
         status += f"检测到 {count} 块 GPU，当前 CUDA 可用 {len(usable)} 块。"
-        if batch_devices:
+        if batch_devices and allow_parallel:
             status += "生成多个独立素材时会按当时的空闲资源启用多卡并发，单个素材使用一块卡。"
+        elif batch_devices:
+            status += "可以启用自动选卡，在资源允许时用多卡并发生成独立素材。"
         else:
             status += "当前以单卡运行条件评估。"
     return {"gpus": gpus, "detected_gpu_count": count, "ram_mib": ram,
