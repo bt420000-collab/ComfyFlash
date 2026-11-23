@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import sqlite3
 import subprocess
 import sys
 from tempfile import NamedTemporaryFile
@@ -339,6 +340,7 @@ def worker_results(args, requests, index, *, safe_memory=False):
     paths = [str(path.expanduser().resolve()) for _, path in requests]
     environment = os.environ.copy()
     environment["CUDA_VISIBLE_DEVICES"] = device_mask(index, environment.get("CUDA_VISIBLE_DEVICES"))
+    environment["COMFYFLASH_DEVICE_LABEL"] = f"cuda:{index}"
     command = [sys.executable, "-B", str(ENTRY), "play", "--config", str(args.config), "--worker"]
     if safe_memory:
         command.append("--safe-memory")
@@ -384,6 +386,23 @@ def batch_result(results, devices):
             "devices": [f"cuda:{index}" for index in devices], "results": results}
 
 
+def preflight_batch(config, requests, paths):
+    """Validate every request before probing GPUs or starting workers; None means all passed."""
+    with Flash(config=config) as flash:
+        errors = [flash._preflight(**request) for request in requests]
+    failed = sum(error is not None for error in errors)
+    if not failed:
+        return None
+    skipped = {"code": "NOT_STARTED", "message": "同批其他请求未通过参数检查，本请求未生成。"}
+    results = [
+        {"ok": False, "file": None, "tone": request.get("tone"), "request": str(path),
+         "error": error or skipped}
+        for request, error, path in zip(requests, errors, paths)
+    ]
+    return {**batch_result(results, []), "code": "BATCH_PREFLIGHT_FAILED",
+            "message": f"{failed} 个请求未通过参数检查，整批未启动。修正后重新提交整批。"}
+
+
 def play(args):
     paths = args.request if isinstance(args.request, list) else [args.request]
     requests = [read_json(path.expanduser()) for path in paths]
@@ -405,6 +424,9 @@ def play(args):
     outputs = [Path(request["output"]).expanduser().resolve() for request in requests if request.get("output")]
     if len(outputs) != len(requests) or len(set(outputs)) != len(outputs):
         raise ValueError("批量请求必须各有一个不同的 output 路径。")
+    rejected = preflight_batch(args.config, requests, paths)
+    if rejected:
+        return rejected
     cfg = load_config(args.config)
     preferred = cfg.get("device", "cuda:0")
     if preferred == "cpu":
@@ -445,6 +467,58 @@ def play(args):
     return result
 
 
+
+def rsi_command(args):
+    """Read or append local RSI records; no service or background process."""
+    from RSI import RSIStore
+
+    store = RSIStore(args.db)
+    action = args.rsi_action
+    if action == "note":
+        context = json.loads(args.context_json) if args.context_json else {}
+        if args.context_file:
+            context_from_file = read_json(args.context_file)
+            context = {**context_from_file, **context} if isinstance(context_from_file, dict) else context_from_file
+        result = store.add_feedback(
+            title=args.title,
+            observation=args.observation,
+            author=args.author,
+            source=args.source,
+            category=args.category,
+            severity=args.severity,
+            impact=args.impact or "",
+            suggestion=args.suggestion or "",
+            run_id=args.run_id,
+            task_id=args.task_id or "",
+            tone=args.tone or "",
+            artifact_path=args.artifact or "",
+            tags=args.tags or [],
+            context=context,
+        )
+        return {"ok": True, "feedback": result, "message": "RSI 点评已记录。"}
+    if action == "list":
+        return {"ok": True, "feedback": store.list_feedback(
+            status=args.status, category=args.category, severity=args.severity,
+            tone=args.tone, run_id=args.run_id, search=args.search, limit=args.limit,
+        )}
+    if action == "show":
+        item = store.get_feedback(args.feedback_id)
+        if item is None:
+            raise ValueError(f"找不到 RSI 点评：{args.feedback_id}")
+        return {"ok": True, "feedback": item}
+    if action == "update":
+        item = store.update_feedback(
+            args.feedback_id, status=args.status, severity=args.severity,
+            resolution=args.resolution,
+        )
+        return {"ok": True, "feedback": item}
+    if action == "runs":
+        return {"ok": True, "runs": store.list_runs(tone=args.tone, status=args.status, limit=args.limit)}
+    if action == "summary":
+        return {"ok": True, "summary": store.summary()}
+    raise ValueError(f"未知 RSI 命令：{action}")
+
+
 def main():
     sys.stdout.reconfigure(encoding="utf-8")
     cli = argparse.ArgumentParser(description=__doc__)
@@ -466,6 +540,59 @@ def main():
     render.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     render.add_argument("--safe-memory", action="store_true", help=argparse.SUPPRESS)
     render.set_defaults(handler=play)
+
+    rsi = actions.add_parser("rsi", help="记录/查询本地 RSI 运行经验与 Agent 点评")
+    rsi.add_argument("--db", type=Path, help="可选的 SQLite 数据库路径")
+    rsi_actions = rsi.add_subparsers(dest="rsi_action", required=True)
+
+    note = rsi_actions.add_parser("note", help="记录 Agent/Human 在工作中的问题或优化点评")
+    note.add_argument("--title", required=True, help="一句话标题")
+    note.add_argument("--observation", "--body", dest="observation", required=True, help="观察到的事实、问题或机会")
+    note.add_argument("--author", default="agent", help="点评者，例如 codex / claude-code / gemini")
+    note.add_argument("--source", choices=("agent", "human", "system"), default="agent")
+    note.add_argument("--category", choices=("bug", "optimization", "performance", "hardware", "quality", "workflow", "api", "compatibility", "idea", "other"), default="optimization")
+    note.add_argument("--severity", choices=("info", "low", "medium", "high", "critical"), default="medium")
+    note.add_argument("--impact", help="影响或收益")
+    note.add_argument("--suggestion", help="建议的优化方向")
+    note.add_argument("--run-id", help="关联一次 ComfyFlash 推理记录")
+    note.add_argument("--task-id", help="外部任务/项目 ID")
+    note.add_argument("--tone", help="关联 Tone，例如 t2")
+    note.add_argument("--artifact", help="关联输出素材路径")
+    note.add_argument("--tag", dest="tags", action="append", help="标签，可重复传入")
+    note.add_argument("--context-json", help="额外上下文 JSON 对象")
+    note.add_argument("--context-file", type=Path, help="从 JSON 文件读取额外上下文")
+    note.set_defaults(handler=rsi_command)
+
+    listing = rsi_actions.add_parser("list", help="列出 Agent 点评")
+    listing.add_argument("--status", choices=("open", "triaged", "planned", "in_progress", "resolved", "wont_fix", "duplicate"))
+    listing.add_argument("--category", choices=("bug", "optimization", "performance", "hardware", "quality", "workflow", "api", "compatibility", "idea", "other"))
+    listing.add_argument("--severity", choices=("info", "low", "medium", "high", "critical"))
+    listing.add_argument("--tone")
+    listing.add_argument("--run-id")
+    listing.add_argument("--search")
+    listing.add_argument("--limit", type=int, default=30)
+    listing.set_defaults(handler=rsi_command)
+
+    show = rsi_actions.add_parser("show", help="查看单条点评")
+    show.add_argument("feedback_id")
+    show.set_defaults(handler=rsi_command)
+
+    update = rsi_actions.add_parser("update", help="更新点评状态或结论")
+    update.add_argument("feedback_id")
+    update.add_argument("--status", choices=("open", "triaged", "planned", "in_progress", "resolved", "wont_fix", "duplicate"))
+    update.add_argument("--severity", choices=("info", "low", "medium", "high", "critical"))
+    update.add_argument("--resolution", help="处理结论或暂不处理原因")
+    update.set_defaults(handler=rsi_command)
+
+    runs = rsi_actions.add_parser("runs", help="查询推理任务记录")
+    runs.add_argument("--tone")
+    runs.add_argument("--status", choices=("success", "failed"))
+    runs.add_argument("--limit", type=int, default=30)
+    runs.set_defaults(handler=rsi_command)
+
+    summary = rsi_actions.add_parser("summary", help="查看 RSI 数据库摘要")
+    summary.set_defaults(handler=rsi_command)
+
     for action in (setup, download, render):
         action.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     args = cli.parse_args()
@@ -473,6 +600,8 @@ def main():
         result = args.handler(args)
     except (OSError, ValueError, TypeError, subprocess.SubprocessError) as exc:
         result = {"ok": False, "code": "SETUP_OR_REQUEST_ERROR", "message": str(exc)}
+    except sqlite3.Error as exc:
+        result = {"ok": False, "code": "RSI_DATABASE_ERROR", "message": str(exc)}
     if not getattr(args, "worker", False) or result.get("code") == "SETUP_OR_REQUEST_ERROR":
         print(json_text(result), end="")
     return 0 if result["ok"] else 1

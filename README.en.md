@@ -174,7 +174,7 @@ Registration returns a `play_argv` array containing the executable and command a
 }
 ~~~
 
-For batch generation, repeat `--request` within one `play` invocation, using a distinct output path for each request. If multiple suitable GPUs are available and sufficient VRAM/system RAM is free, separate assets may run on different GPUs. Otherwise the engine falls back to sequential execution on one GPU. A single asset is handled by one GPU, and generation processes exit when the invocation completes.
+For batch generation, repeat `--request` within one `play` invocation, using a distinct output path for each request. Before any GPU probe or worker starts, every request is checked for parameters, input files, and weights. If any request fails, the whole batch returns within about a second with `code: "BATCH_PREFLIGHT_FAILED"`; each failing item carries its error and request path, and the valid items are marked `NOT_STARTED`. If multiple suitable GPUs are available and sufficient VRAM/system RAM is free, separate assets may run on different GPUs. Otherwise the engine falls back to sequential execution on one GPU. A single asset is handled by one GPU, and generation processes exit when the invocation completes.
 
 Batch scheduling checks free VRAM reported by CUDA and the NVIDIA device for each GPU. On Windows, batch workers using dynamic VRAM disable pinned host memory by default. After an AIMDO weight-buffer failure, ComfyFlash preserves completed files, waits for the batch's workers to exit, then retries outstanding requests once on one GPU with more conservative settings and the original generation parameters.
 

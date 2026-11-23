@@ -10,3 +10,12 @@ __pycache__/
 *.safetensors
 *.ckpt
 *.gguf
+
+# Local RSI history (keep RSI source and docs versioned)
+/RSI/data/*.sqlite3
+/RSI/data/*.sqlite3-wal
+/RSI/data/*.sqlite3-shm
+/RSI/data/*.db
+/RSI/data/*.db-wal
+/RSI/data/*.db-shm
+/RSI/data/*.sqlite3-journal

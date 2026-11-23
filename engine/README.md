@@ -6,6 +6,10 @@
 
 ```
 ComfyFlash/
+├── RSI/
+│   ├── __init__.py       # 独立 RSI 记忆模块入口
+│   ├── store.py          # SQLite 短连接读写：推理记录与 Agent 点评
+│   └── README.md         # RSI 数据结构、CLI 与 Python API
 ├── engine/
 │   ├── __init__.py       # 对外只暴露 Flash
 │   ├── core.py           # 配置、参数校验、模型热复用、执行生命周期
@@ -194,7 +198,7 @@ ComfyUI 15,494 MiB。上述峰值是本次测试观测值。
 1. 视频画布两轴按 32 对齐，面积上限约 768×1344，支持 768×448 等自定义画布。24 fps 的帧数向上吸附到 `17k+5`。
 2. t2 每个采样步都处理参考图的 latent。可用画布、时长和显存取决于参考内容与设备负载。
 3. 视频使用当前已验证的 INT8 VAE。旧式显存路径继续在视频解码前主动卸载采样模型。
-4. 同一进程内的生成串行运行，多块显卡可分别交给独立进程。四种 Tone 继续通过 `Flash.play()` 直接产出文件。
+4. 同一进程内的生成串行运行，多块显卡可分别交给独立进程。四种 Tone 继续通过 `Flash.play()` 直接产出文件。批量命令在探测硬件前用 `Flash._preflight()` 检查全部请求（不加载推理库），任一不合格即整批返回 `BATCH_PREFLIGHT_FAILED`。
 5. NVIDIA 批量调度按显卡 UUID 核对 CUDA 和设备级剩余显存，取较小值。多卡批次遇到显存错误时，保留已完成的结果，等本批所有进程退出后，用最空闲的一张卡按原参数重试失败项一次。AIMDO 权重缓冲区读取或截断失败会结束出错进程，失败和未启动的请求也会按原参数在新进程中重试一次，包括只分配到一张 GPU 的批次。
 6. `Flash.play()` 遇到 CUDA OOM 会返回 `OOM`，并清理已加载模型和引擎缓存。调用方可在同一个会话继续发起下一条请求。
 
@@ -216,3 +220,46 @@ ComfyUI 15,494 MiB。上述峰值是本次测试观测值。
 - 2026-11-16 性能优化。对齐 Pika 六步配方，接入原生动态显存，复用装配后的 LoRA，并建立单卡 ComfyUI 对照。
 
 - 2026-11-16 添加 Agent 对话与项目注册、直接调用命令和开源交付文件。
+
+
+## 9. RSI：推理记忆与 Agent 点评
+
+每次完成有效参数预检的推理后，Engine 会尽力追加一条本地运行记录，并在结果中返回 `run_id`。记录包含 Tone、设备标签、参数摘要、耗时、输出路径和技术元数据；提示词正文不会写入数据库，只保留 SHA-256 和字符数。RSI 写入失败会记录警告，但不会让已经成功的生成失败。
+
+Agent 可在工作中对 ComfyFlash 的可复用问题或优化机会留下点评：
+
+```text
+python -B engine/agent.py rsi note --title "视频任务显存峰值偏高" --observation "t2 在指定画布下出现 OOM，关联运行记录可复现" --category hardware --severity high --author codex --run-id "<run_id>" --tone t2 --suggestion "对照不同设备和解码策略测量峰值"
+```
+
+查询与处理：
+
+```text
+python -B engine/agent.py rsi list --status open
+python -B engine/agent.py rsi show <feedback_id>
+python -B engine/agent.py rsi update <feedback_id> --status planned --resolution "安排到下一轮"
+python -B engine/agent.py rsi runs --tone t2
+python -B engine/agent.py rsi summary
+```
+
+Python API：
+
+```python
+from engine import Flash
+
+with Flash() as flash:
+    result = flash.play("t3", prompt="...", output="D:/output.png")
+    if result.get("run_id"):
+        flash.rsi.add_feedback(
+            title="发现可优化点",
+            observation="实际观察和复现条件",
+            category="optimization",
+            severity="medium",
+            author="codex",
+            run_id=result["run_id"],
+            tone="t3",
+            suggestion="建议验证的方向",
+        )
+```
+
+数据库默认位于 `RSI/data/comfyflash.sqlite3`，首次读写时才创建。它使用 Python 标准库 SQLite、WAL、短事务和短连接，不启动数据库服务或后台线程。可在 `models/config.json` 中设置 `rsi_enabled: false` 只关闭自动运行记录，不影响手动 Agent 点评；也可通过 `rsi_db_path` 指定数据库位置。详见 [`RSI/README.md`](../RSI/README.md)。

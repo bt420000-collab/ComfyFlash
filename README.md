@@ -27,7 +27,8 @@
 - **按需扩展**：每个功能模块独立声明用途、输入、支持的参数和依赖；Agent 可自动发现。
 - **统一接口**：图像、音频等输入输出及分辨率、时长、随机种子等常用参数由引擎统一处理。
 - **复用资源**：共享现有模型权重，按需加载；同一 Python 进程可复用已加载的模型。
-- **只负责推理**：镜头安排、素材组合、批量生产等业务规划交给 Agent，而不是固化成复杂工作流。
+- **动态工作流方向**：不是取消工作流，而是取消预制工作流对 Agent 的束缚；目标是让 Agent 根据任务临时生成和调整 Plan，Tone 提供可复用的原子能力。当前版本仍由 Agent 通过直接调用组织多步任务，原生 Plan 执行层逐步演进。
+- **RSI 本地经验记忆**：记录有效推理任务，并允许 AI Agent 作为实际使用者留下问题和优化点评，供后续检索与针对性改进。SQLite 按需读写，不启动数据库服务。
 
 *ComfyFlash is a lightweight, modular local inference engine for AI agents. It exposes discoverable capabilities through a consistent Python interface, without a workflow editor or background API server. H3/Pika is the first supported model family, not a permanent product limitation.*
 
@@ -63,7 +64,7 @@
 | **输入输出（Interface）** | 提供一致的文本、图像等输入及文件输出方式 |
 | **AI Agent** | 发现功能、选择工具、决定如何组合和使用 |
 
-**模块只负责自身的推理能力。** 通用参数和文件处理不必在每个模块里重复实现；任务如何拆分、组合哪些功能由 Agent 决定。增加新功能时，在模块库内声明接口和实现，Agent 就能通过相同的调用方式使用它。不同模型架构可能需要新增底层适配代码，但对外接口不必随之变化。
+**模块只负责自身的推理能力。** 通用参数和文件处理不必在每个模块里重复实现；任务如何拆分、组合哪些功能由 Agent 决定。预制工作流不应束缚 Agent：产品方向是让它按当前任务临时生成 Plan，在观察中间结果后修改步骤、局部重跑或继续。当前版本由 Agent 通过直接调用组织多步任务，原生 Plan 执行层尚待建设。Engine 未来负责校验和执行，不替 Agent 决定创作策略。增加新功能时，在模块库内声明接口和实现，Agent 就能通过相同的调用方式使用它。不同模型架构可能需要新增底层适配代码，但对外接口不必随之变化。
 
 > 内部沿用 `Bank / Tone / Controls / Interface` 等命名，设计灵感来自电子琴的功能组织方式。这里的 `Tone` 指**独立推理功能**，不是音频音色，也不意味着项目只能处理音乐。
 
@@ -121,7 +122,9 @@ with Flash() as flash:
 
 注册通过后，除非你指定其他工具，当前对话及已注册项目默认使用 ComfyFlash 生图、生成视频和编辑图片。ComfyFlash 在本机生成，消耗本机算力，云端生成额度和 API token 消耗为零。Agent 的对话和工具调度仍按客户端计量。
 
-Agent 在当前对话首次编写某种生成或编辑提示词前，会读取随包提供的对应指南。两份指南覆盖四种功能，每种都附一个完整示例。已有的项目技能可通过重新注册更新。[H3 视频提示词指南](engine/skills/comfyflash/references/h3-video.md) · [H3 图片提示词指南](engine/skills/comfyflash/references/h3-image.md)
+Agent 在当前对话首次编写某种生成或编辑提示词前，会读取随包提供的对应指南。两份指南覆盖四种功能，每种都附一个完整示例。已有的项目技能可通过重新注册更新。
+
+ComfyFlash 还会把有效推理记录写入本地 RSI 记忆库。Agent 在工作中发现引擎问题或可复用的优化机会时，可以通过 `python -B engine/agent.py rsi note ...` 留下点评，后续按类别、Tone、运行记录检索并针对性改进。RSI 使用按需打开的 SQLite，不启动后台服务；详细用法见 [RSI 说明](RSI/README.md)。[H3 视频提示词指南](engine/skills/comfyflash/references/h3-video.md) · [H3 图片提示词指南](engine/skills/comfyflash/references/h3-image.md)
 
 ## 首次配置
 
@@ -165,7 +168,7 @@ python -B engine/agent.py register --comfyui-root "D:/ComfyUI/ComfyUI" --models-
 }
 ```
 
-批量生成时，在同一次 `play` 命令中重复传入 `--request`，每个请求使用独立的输出路径。检测到多张合适的 GPU 且当时有足够的空闲显存与内存时，每张卡处理独立的素材。资源不足时回退到单卡顺序生成。单个素材使用一张卡，所有生成进程随此次调用结束。
+批量生成时，在同一次 `play` 命令中重复传入 `--request`，每个请求使用独立的输出路径。引擎在探测 GPU 和启动生成进程之前，先检查全部请求的参数、输入文件和权重。任一请求不合格时整批约一秒内返回 `code: "BATCH_PREFLIGHT_FAILED"`，出错项附带错误和请求文件路径，合格项标记为 `NOT_STARTED`。检测到多张合适的 GPU 且当时有足够的空闲显存与内存时，每张卡处理独立的素材。资源不足时回退到单卡顺序生成。单个素材使用一张卡，所有生成进程随此次调用结束。
 
 批量调度会核对 CUDA 和 NVIDIA 设备报告的逐卡剩余显存。Windows 上使用动态显存的批量进程默认关闭锁页内存。遇到 AIMDO 权重缓冲区读写失败时，保留已完成的文件，并在本批进程退出后，用更保守的设置按原参数单卡重试一次。
 

@@ -3,5 +3,7 @@
   "comfyui_models_path": "D:/ComfyUI/ComfyUI/models",
   "device": "cuda:0",
   "dynamic_vram": true,
-  "vram_headroom_gb": 0.1
+  "vram_headroom_gb": 0.1,
+  "rsi_enabled": true,
+  "rsi_db_path": "RSI/data/comfyflash.sqlite3"
 }

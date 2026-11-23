@@ -36,7 +36,10 @@ class MemoryTests(unittest.TestCase):
         runtime.generation.side_effect = nullcontext
         runtime.is_oom.side_effect = lambda exc: exc is failure
         with TemporaryDirectory() as folder:
-            flash = Flash(config={"comfyui_root": folder})
+            flash = Flash(config={
+                "comfyui_root": folder,
+                "rsi_db_path": str(Path(folder) / "rsi.sqlite3"),
+            })
             flash._rt = runtime
             output = str(Path(folder, "test.png"))
             model = ("unet", "oom-test")
@@ -122,7 +125,7 @@ class MemoryTests(unittest.TestCase):
             hardware = {"active_devices": [], "gpus": [
                 {"index": 0, "free_mib": 15400, "total_mib": 16000, "ready": True},
             ]}
-            with patch.object(agent, "probe_python"), patch.object(agent, "hardware_report", return_value=hardware), patch.object(
+            with patch.object(agent, "preflight_batch", return_value=None), patch.object(agent, "probe_python"), patch.object(agent, "hardware_report", return_value=hardware), patch.object(
                 agent, "worker_results", side_effect=[[(0, success), (1, failure), (2, skipped)], [(1, success), (2, success)]]
             ) as run:
                 result = agent.play(argparse.Namespace(config=config, request=paths))
@@ -171,7 +174,7 @@ class MemoryTests(unittest.TestCase):
                 self.assertEqual(positions, [1])
                 return [(1, oom if index == 1 else recovered)]
 
-            with patch.object(agent, "probe_python"), patch.object(agent, "hardware_report", return_value=hardware), patch.object(
+            with patch.object(agent, "preflight_batch", return_value=None), patch.object(agent, "probe_python"), patch.object(agent, "hardware_report", return_value=hardware), patch.object(
                 agent, "worker_results", side_effect=worker
             ) as run:
                 result = agent.play(argparse.Namespace(config=config, request=paths))

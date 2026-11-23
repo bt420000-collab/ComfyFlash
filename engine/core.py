@@ -15,6 +15,7 @@ import contextlib
 import io as _io
 import json
 import logging
+import os
 import random
 import threading
 import time
@@ -70,6 +71,15 @@ def resolve_config(settings, path=None) -> dict:
         for key in ("diffusion_models", "text_encoders", "vae", "loras")
     }
     cfg["_path"] = str(path) if path else None
+    cfg["_rsi_enabled"] = bool(cfg.get("rsi_enabled", True))
+    rsi_path = cfg.get("rsi_db_path") or os.getenv("COMFYFLASH_RSI_DB")
+    if rsi_path:
+        rsi_path = Path(rsi_path).expanduser()
+        if not rsi_path.is_absolute():
+            rsi_path = _ROOT / rsi_path
+    else:
+        rsi_path = _ROOT / "RSI" / "data" / "comfyflash.sqlite3"
+    cfg["_rsi_db_path"] = str(rsi_path.resolve())
     return cfg
 
 
@@ -240,6 +250,29 @@ class Flash:
         self._clock = 0
         self._lock = _EXECUTION_LOCK
         self._closed = False
+        self._rsi_store = None
+
+    @property
+    def rsi(self):
+        """Lazy access to the local RSI notebook; no connection stays open."""
+        if self._rsi_store is None:
+            from RSI import RSIStore
+            self._rsi_store = RSIStore(self._cfg.get("_rsi_db_path"))
+        return self._rsi_store
+
+    def _record_rsi_run(self, result, tone, spec, request):
+        if not self._cfg.get("_rsi_enabled", True) or request is None or spec is None:
+            return result
+        device = os.getenv("COMFYFLASH_DEVICE_LABEL") or self._cfg.get("device", "cuda:0")
+        result.setdefault("device", device)
+        try:
+            result["run_id"] = self.rsi.record_run(
+                result, tone=tone, spec=spec, request=request, device=device,
+            )
+        except Exception:
+            # RSI is an observability layer, never a dependency of image/video inference.
+            logging.getLogger(__name__).warning("Unable to persist RSI run record", exc_info=True)
+        return result
 
     # ------------------------------------------------------------- 生命周期
     def __enter__(self):
@@ -366,6 +399,8 @@ class Flash:
     ):
         started = time.time()
         seed_value = None
+        spec = None
+        req = None
         verbose = self.verbose if verbose is None else bool(verbose)
         try:
             spec = self._spec(tone)
@@ -410,7 +445,7 @@ class Flash:
                         finally:
                             self._cache.clear()
                             self._tick.clear()
-                    return result
+                    return self._record_rsi_run(result, tone, spec, req)
 
             result = {
                 "ok": True,
@@ -422,14 +457,32 @@ class Flash:
             result.update(meta)
             if verbose:
                 result["log"] = (buf_err.getvalue() + buf_out.getvalue())[-4000:]
-            return result
+            return self._record_rsi_run(result, tone, spec, req)
 
         except ParamError as exc:
-            return self._fail(tone, seed_value, exc, None, started, exc.code)
+            result = self._fail(tone, seed_value, exc, None, started, exc.code)
+            return self._record_rsi_run(result, tone, spec, req)
         except Exception as exc:
-            return self._fail(tone, seed_value, exc, None, started, "ENGINE_ERROR")
+            result = self._fail(tone, seed_value, exc, None, started, "ENGINE_ERROR")
+            return self._record_rsi_run(result, tone, spec, req)
 
     # ------------------------------------------------------------- 内部
+    def _preflight(self, tone=None, prompt=None, image_in=None, audio_in=None, resolution=None,
+                   duration=None, seed=None, output=None, verbose=None, **advanced):
+        """只做参数与模型文件检查，不加载推理库；通过返回 None，否则返回 error 字典。"""
+        if tone is None:
+            return {"code": "MISSING_INPUT", "message": "请求缺少 tone（可用：{}）".format(", ".join(TONES))}
+        try:
+            spec = self._spec(tone)
+            self._resolve(spec, prompt, image_in, audio_in, resolution, duration, seed, output, dict(advanced))
+            for key, name in (spec.get("models") or {}).items():
+                self.model_path(name, _MODEL_KINDS[key])
+        except ParamError as exc:
+            return {"code": exc.code, "message": exc.message}
+        except (TypeError, ValueError, OSError) as exc:
+            return {"code": "BAD_REQUEST", "message": str(exc)}
+        return None
+
     def _spec(self, tone: str) -> dict:
         module = TONES.get(str(tone))
         if module is None:

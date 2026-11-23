@@ -196,6 +196,68 @@ class RegistrationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "不同的 output"):
             agent.play(args)
 
+    def write_requests(self, *requests):
+        paths = []
+        for index, request in enumerate(requests):
+            path = self.root / f"batch{index}.json"
+            path.write_text(agent.json_text(request), encoding="utf-8")
+            paths.append(path)
+        return paths
+
+    def test_invalid_batch_request_fails_fast_before_gpu_probe_or_workers(self):
+        self.models_for(*TONES)
+        self.run_registration()
+        picture = self.root / "ref.png"
+        picture.write_bytes(b"png")
+        paths = self.write_requests(
+            {"tone": "t2", "prompt": "valid", "image_in": [str(picture)], "output": str(self.root / "a.mp4")},
+            {"tone": "t4", "prompt": "missing picture", "output": str(self.root / "b.png")},
+            {"prompt": "no tone", "output": str(self.root / "c.png")},
+            {"tone": "t3", "prompt": "typo", "stpes": 6, "output": str(self.root / "d.png")},
+        )
+        with patch.object(agent, "probe_python") as probe, patch.object(agent, "worker_results") as worker:
+            result = agent.play(argparse.Namespace(config=self.args.config, request=paths))
+        probe.assert_not_called()
+        worker.assert_not_called()
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "BATCH_PREFLIGHT_FAILED")
+        self.assertIn("3 个请求", result["message"])
+        codes = [item["error"]["code"] for item in result["results"]]
+        self.assertEqual(codes, ["NOT_STARTED", "MISSING_INPUT", "MISSING_INPUT", "UNSUPPORTED_CONTROL"])
+        self.assertEqual([item["request"] for item in result["results"]], [str(path) for path in paths])
+
+    def test_valid_batch_passes_preflight_and_reaches_workers(self):
+        self.models_for(*TONES)
+        self.run_registration()
+        paths = self.write_requests(
+            {"tone": "t3", "prompt": "one", "output": str(self.root / "a.png")},
+            {"tone": "t3", "prompt": "two", "resolution": "1:1", "seed": 3, "output": str(self.root / "b.png")},
+        )
+        hardware = {"active_devices": [], "summary": "", "gpus": [
+            {"index": 0, "free_mib": 15000, "total_mib": 16000, "ready": True},
+        ]}
+        done = [(0, {"ok": True}), (1, {"ok": True})]
+        with patch.object(agent, "probe_python"), patch.object(agent, "hardware_report", return_value=hardware), \
+                patch.object(agent, "worker_results", return_value=done) as worker:
+            result = agent.play(argparse.Namespace(config=self.args.config, request=paths))
+        worker.assert_called_once()
+        self.assertTrue(result["ok"])
+        self.assertNotIn("code", result)
+
+    def test_missing_weight_is_caught_by_batch_preflight(self):
+        self.models_for(*TONES)
+        self.run_registration()
+        lora = TONES["t1"].TONE["models"]["lora"]
+        (self.weights / _MODEL_KINDS["lora"] / lora).unlink()
+        paths = self.write_requests(
+            {"tone": "t3", "prompt": "one", "output": str(self.root / "a.png")},
+            {"tone": "t1", "prompt": "two", "output": str(self.root / "b.mp4")},
+        )
+        with patch.object(agent, "probe_python") as probe:
+            result = agent.play(argparse.Namespace(config=self.args.config, request=paths))
+        probe.assert_not_called()
+        self.assertEqual([item["error"]["code"] for item in result["results"]], ["NOT_STARTED", "MISSING_MODEL"])
+
 
 if __name__ == "__main__":
     unittest.main()
