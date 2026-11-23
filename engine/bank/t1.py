@@ -13,14 +13,22 @@ from __future__ import annotations
 
 from .. import h3
 
-TONE = {
+from .h3_contract import h3_tone
+
+TONE = h3_tone({
     "id": "t1",
     "name": "Pika 文生视频",
     "purpose": "一句 prompt 生成带同期声的短视频，Pika Flex 的运动与镜头质感",
     "output": "video",
     "inputs": {"required": ["prompt"], "optional": []},
+    "prompt_format": {
+        "required": True,
+        "name": 'MiniMax H3 T2VA',
+        "guide": 'engine/skills/comfyflash/references/h3-video.md',
+        "instruction": '必须改写为官方 T2VA 三段结构：integrated_multimodal_description、overall_soundscape、non_diegetic_music；不可默认直接传入原始需求或普通翻译。',
+    },
     "controls": {
-        "prompt": {"note": "自然语言；H3 会同时生成画面与声音，可在 prompt 里描述环境声"},
+        "prompt": {"note": "必须按 H3 T2VA 三段专用格式编写：integrated_multimodal_description / overall_soundscape / non_diegetic_music；画面与声音描述用英文，对白保留原文。"},
         "resolution": {
             "default": "16:9",
             "presets": ["16:9", "9:16", "1:1", "4:3", "3:4", "21:9", "720p", "WxH"],
@@ -57,7 +65,7 @@ TONE = {
         "只吃 prompt；需要参考图请换 t2。",
         "声音由模型联合生成，v0.1 不接受 audio_in。",
     ],
-}
+}, capability="text_to_video")
 
 
 def play(run):

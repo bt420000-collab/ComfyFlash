@@ -13,14 +13,22 @@ from __future__ import annotations
 
 from .. import h3
 
-TONE = {
+from .h3_contract import h3_tone
+
+TONE = h3_tone({
     "id": "t3",
     "name": "H3 文生图",
     "purpose": "一句 prompt 出高质量静帧，默认 1024x1024",
     "output": "image",
     "inputs": {"required": ["prompt"], "optional": []},
+    "prompt_format": {
+        "required": True,
+        "name": 'MiniMax H3-Image T2I',
+        "guide": 'engine/skills/comfyflash/references/h3-image.md',
+        "instruction": '必须按官方 H3-Image 文生图规则写完整英文画面描述：用途与任务、布局、主体关系、视觉细节、精确可见文字；不要使用关键词堆砌。',
+    },
     "controls": {
-        "prompt": {"note": "自然语言描述画面；模型对细节长句的服从度比短词好"},
+        "prompt": {"note": "必须按 H3-Image T2I 指南写完整英文画面描述，任务和布局优先，精确标注可见文字或明确说明无文字。"},
         "resolution": {
             "default": "1k",
             "presets": ["1k", "2k", "max", "16:9", "9:16", "1:1", "4:3", "3:4", "WxH"],
@@ -44,7 +52,7 @@ TONE = {
         "图像 Tone 不使用 duration，传了会直接报错。",
         "要改图请换 t4（带 image_in）。",
     ],
-}
+}, capability="text_to_image")
 
 
 def play(run):

@@ -1,4 +1,4 @@
-"""Comfy Flash H3 v0.1 —— 只装音色的播放器。
+"""ComfyFlash 的同步本地推理接口。
 
 对外唯一入口：
 
@@ -12,4 +12,4 @@
 from .core import Flash
 
 __all__ = ["Flash"]
-__version__ = "0.1.0"
+__version__ = "0.2.0"

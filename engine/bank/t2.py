@@ -15,16 +15,26 @@ from __future__ import annotations
 
 from .. import h3, media
 
-TONE = {
+from .h3_contract import h3_tone
+
+TONE = h3_tone({
     "id": "t2",
     "name": "Pika 参考生视频",
     "purpose": "给一张参考图，生成保持人物/场景一致、带同期声的短视频",
     "output": "video",
     "inputs": {"required": ["prompt", "image_in"], "optional": []},
+    "prompt_format": {
+        "required": True,
+        "name": 'MiniMax H3 Ref2VA',
+        "guide": 'engine/skills/comfyflash/references/h3-video.md',
+        "instruction": '必须改写为官方 Ref2VA 六段结构：subject_definitions、summary、retention_analysis、detailed_description、overall_soundscape、non_diegetic_music；统一引用标签。',
+    },
     "controls": {
-        "prompt": {"note": "用 <Picture 1> 指代参考图，例如「<Picture 1> 里的女孩转身微笑」"},
+        "prompt": {"note": "必须按 H3 Ref2VA 六段专用格式编写；使用 <Picture 1> / <Subject N> 并保持引用标签一致。"},
         "image_in": {
-            "note": "单张参考图（绝对路径，可传 1 个元素的列表）；只取第一张",
+            "max_items": 1,
+            "min_items": 1,
+            "note": "单张参考图（绝对路径或图像 Artifact，可传 1 个元素的列表）；超出数量会在生成前拒绝",
             "limits": "会按本次画布面积等比缩小，不放大",
         },
         "resolution": {
@@ -63,7 +73,7 @@ TONE = {
         "必须给 image_in；只要文字请换 t1。",
         "声音由模型联合生成，v0.1 不接受 audio_in。",
     ],
-}
+}, capability="reference_image_to_video", image_role="reference_image")
 
 
 def play(run):
@@ -71,8 +81,6 @@ def play(run):
     clip = run.clip()
     vae_video = run.vae("vae_video")
 
-    if len(run.image_paths) > 1:
-        run.meta["images_note"] = "t2 只取第一张参考图，其余 {} 张已忽略".format(len(run.image_paths) - 1)
     reference = media.load_image(rt, run.image_paths[0])
 
     # The v0.1 sampler used a reference latent cast to the model dtype.

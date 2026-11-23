@@ -5,30 +5,42 @@
     也过 Image-VAE 变成 ref latent（短边 1024–2048）随每一步回灌。
 prompt 里用 <Picture 1> 指代它。
 
-默认画布跟随输入图（resolution="match"），也可显式给 1k/2k/max/比例/WxH。
+默认画布跟随输入图的比例与参考尺寸区间（resolution="match"），不保证逐像素等于原图；
+如需指定模型画布，可传 WxH（两轴为 32 的倍数），例如 1376x768。
 """
 
 from __future__ import annotations
 
 from .. import h3, media
 
-TONE = {
+from .h3_contract import h3_tone
+
+TONE = h3_tone({
     "id": "t4",
     "name": "H3 图片编辑",
     "purpose": "给一张图加一句指令，按原图结构改画面",
     "output": "image",
     "inputs": {"required": ["prompt", "image_in"], "optional": []},
+    "prompt_format": {
+        "required": True,
+        "name": 'MiniMax H3-Image Edit',
+        "guide": 'engine/skills/comfyflash/references/h3-image.md',
+        "instruction": '必须按官方 H3-Image 编辑规则写成一个连续英文段落：源图/主体定义、目标画面与保留关系、具体修改；使用 <Picture 1>。',
+    },
     "controls": {
-        "prompt": {"note": "用 <Picture 1> 指代原图，例如「把 <Picture 1> 的背景换成雪山黄昏」"},
+        "prompt": {"note": "必须按 H3-Image Edit 指南写一个连续英文段落：源图定义、目标与保留关系、修改细节；使用 <Picture 1>。"},
         "image_in": {
-            "note": "单张待编辑图（绝对路径，可传 1 个元素的列表）；只取第一张",
+            "max_items": 1,
+            "min_items": 1,
+            "note": "单张待编辑图（绝对路径或图像 Artifact，可传 1 个元素的列表）；超出数量会在生成前拒绝",
             "limits": "Qwen 视觉通道缩到短边 1024，VAE ref latent 缩到短边 1024–2048",
         },
         "resolution": {
             "default": "match",
             "presets": ["match", "1k", "2k", "max", "16:9", "9:16", "1:1", "4:3", "3:4", "WxH"],
-            "limits": "match=跟随输入图尺寸（短边 1024–2048）；1k=1024x1024（单卡 16GB 实测可用）；"
-                      "2k / max 更吃显存；两轴 32 的倍数",
+            "limits": "match=保持输入图比例，将短边标准化到 1024–2048 并对齐 32 像素，不保证与输入像素尺寸相同；"
+                      "如需指定画布可用 WxH（两轴均须为 32 的倍数）。1k=1024x1024（单卡 16GB 实测可用）；"
+                      "2k / max 更吃显存",
         },
         "seed": {"default": None, "limits": "None=随机（结果里回传实际种子）；整数=固定"},
     },
@@ -51,7 +63,7 @@ TONE = {
         "必须给 image_in；纯文字出图请换 t3。",
         "图像 Tone 不使用 duration，传了会直接报错。",
     ],
-}
+}, capability="image_edit", image_role="edit_source")
 
 
 def play(run):
@@ -61,9 +73,8 @@ def play(run):
     prompt = run.prompt
     if "<Picture" not in prompt:
         prompt = str(run.params.get("prompt_prefix") or "") + prompt
+    run.prompt = prompt
 
-    if len(run.image_paths) > 1:
-        run.meta["images_note"] = "t4 只编辑第一张图，其余 {} 张已忽略".format(len(run.image_paths) - 1)
     images = [media.load_image(rt, run.image_paths[0])]
 
     cond, latent = run.condition(

@@ -1,6 +1,7 @@
 import argparse
 from contextlib import nullcontext
 import json
+import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -8,10 +9,17 @@ from unittest.mock import Mock, patch
 
 from engine import Flash, agent, setup_checks
 from engine.bank import TONES
-from engine.runtime import Runtime
+from engine.runtime import Runtime, _pin_device
 
 
 class MemoryTests(unittest.TestCase):
+    def test_pin_respects_visible_ordinals_and_worker_mask(self):
+        with patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "GPU-alpha,GPU-bravo"}):
+            _pin_device("cuda:1")
+            self.assertEqual(os.environ["CUDA_VISIBLE_DEVICES"], "GPU-bravo")
+            _pin_device("cuda:1")
+            self.assertEqual(os.environ["CUDA_VISIBLE_DEVICES"], "GPU-bravo")
+
     def test_scheduler_uses_physical_free_memory_of_the_matching_gpu(self):
         devices = [
             {"index": 0, "uuid": "b", "total_mib": 16300, "free_mib": 15172, "ready": True},
@@ -28,6 +36,22 @@ class MemoryTests(unittest.TestCase):
         self.assertEqual(report["gpus"][0]["free_mib"], 2300)
         self.assertEqual(report["gpus"][1]["free_mib"], 15172)
         self.assertEqual(devices[0]["free_mib"], 15172)
+        decisions = {item["index"]: item for item in report["batch_decisions"]}
+        self.assertFalse(decisions[0]["eligible"])
+        self.assertTrue(any("FREE_VRAM_BELOW_BATCH_THRESHOLD" in reason for reason in decisions[0]["reasons"]))
+        self.assertTrue(decisions[1]["eligible"])
+
+    def test_batch_device_decision_explains_138_gib_free_vram_without_lowering_threshold(self):
+        runtime = {"ram_mib": 49152, "free_ram_mib": 30000, "gpus": [
+            {"index": 0, "uuid": "gpu-a", "name": "GPU A", "total_mib": 16384, "free_mib": 15500, "ready": True},
+            {"index": 1, "uuid": "gpu-b", "name": "GPU B", "total_mib": 16384, "free_mib": 14131, "ready": True},
+        ]}
+        with patch.object(setup_checks, "nvidia_inventory", return_value=[]):
+            report = setup_checks.hardware_report(runtime)
+        self.assertEqual(report["active_devices"], [0])
+        decision = next(item for item in report["batch_decisions"] if item["index"] == 1)
+        self.assertFalse(decision["eligible"])
+        self.assertTrue(any("FREE_VRAM_BELOW_BATCH_THRESHOLD_14336_MIB" in reason for reason in decision["reasons"]))
 
     def test_typed_oom_unloads_models_and_the_next_request_can_run(self):
         failure = RuntimeError("allocation failed (code 2)")
@@ -118,21 +142,24 @@ class MemoryTests(unittest.TestCase):
         with TemporaryDirectory() as folder:
             root = Path(folder)
             config = root / "config.json"
-            agent.write_text(config, agent.json_text({"comfyui_root": folder}))
+            agent.write_text(config, agent.json_text({"comfyui_root": folder, "rsi_enabled": False,
+                                                     "telemetry_enabled": False}))
             paths = [root / f"{i}.json" for i in range(3)]
             for i, path in enumerate(paths):
                 agent.write_text(path, agent.json_text({"output": str(root / f"{i}.mp4")}))
             hardware = {"active_devices": [], "gpus": [
                 {"index": 0, "free_mib": 15400, "total_mib": 16000, "ready": True},
             ]}
-            with patch.object(agent, "preflight_batch", return_value=None), patch.object(agent, "probe_python"), patch.object(agent, "hardware_report", return_value=hardware), patch.object(
+            with patch.object(agent, "preflight_requests", return_value={"ok": True, "results": [], "validations": []}), patch.object(
+                agent, "probe_python"
+            ), patch.object(agent, "hardware_report", return_value=hardware), patch.object(
                 agent, "worker_results", side_effect=[[(0, success), (1, failure), (2, skipped)], [(1, success), (2, success)]]
             ) as run:
                 result = agent.play(argparse.Namespace(config=config, request=paths))
             self.assertEqual(run.call_count, 2)
             self.assertEqual(run.call_args.args[1:], ([(1, paths[1]), (2, paths[2])], 0))
             self.assertEqual(run.call_args.kwargs, {"safe_memory": True})
-        self.assertEqual(result["results"], [success, success, success])
+        self.assertEqual(result["results"], [dict(success, request_index=i, request_id=i) for i in range(3)])
         self.assertEqual(result["serial_retries"], 2)
 
     def test_windows_batch_defaults_to_unpinned_host_memory_and_respects_explicit_override(self):
@@ -141,8 +168,8 @@ class MemoryTests(unittest.TestCase):
             with self.subTest(settings=settings), patch.object(agent.sys, "platform", "win32"), patch.object(
                 agent, "read_json", return_value={"tone": "t2"}
             ), patch.object(agent, "load_config", return_value=settings.copy()), patch.object(
-                agent, "render_requests", return_value=[{"ok": True}]
-            ) as render:
+                agent, "preflight_requests", return_value={"ok": True, "results": [], "validations": []}
+            ), patch.object(agent, "render_requests", return_value=[{"ok": True}]) as render:
                 self.assertTrue(agent.play(args)["ok"])
                 config = render.call_args.args[0]
                 if not isinstance(config, dict):
@@ -158,13 +185,14 @@ class MemoryTests(unittest.TestCase):
         with TemporaryDirectory() as folder:
             root = Path(folder)
             config = root / "config.json"
-            agent.write_text(config, agent.json_text({"comfyui_root": folder}))
+            agent.write_text(config, agent.json_text({"comfyui_root": folder, "rsi_enabled": False,
+                                                     "telemetry_enabled": False}))
             paths = [root / f"{i}.json" for i in range(3)]
             for i, path in enumerate(paths):
                 agent.write_text(path, agent.json_text({"output": str(root / f"{i}.mp4")}))
-            hardware = {"active_devices": [0, 1], "gpus": [
+            hardware = {"active_devices": [0, 1], "free_ram_mib": 45000, "gpus": [
                 {"index": 0, "free_mib": 15000, "total_mib": 16000, "ready": True},
-                {"index": 1, "free_mib": 14000, "total_mib": 16000, "ready": True},
+                {"index": 1, "free_mib": 14800, "total_mib": 16000, "ready": True},
             ]}
             def worker(args, requests, index, *, safe_memory=False):
                 self.assertFalse(safe_memory)
@@ -174,10 +202,13 @@ class MemoryTests(unittest.TestCase):
                 self.assertEqual(positions, [1])
                 return [(1, oom if index == 1 else recovered)]
 
-            with patch.object(agent, "preflight_batch", return_value=None), patch.object(agent, "probe_python"), patch.object(agent, "hardware_report", return_value=hardware), patch.object(
+            with patch.object(agent, "preflight_requests", return_value={"ok": True, "results": [], "validations": []}), patch.object(
+                agent, "probe_python"
+            ), patch.object(agent, "hardware_report", return_value=hardware), patch.object(
                 agent, "worker_results", side_effect=worker
             ) as run:
                 result = agent.play(argparse.Namespace(config=config, request=paths))
             self.assertEqual(run.call_count, 3)
-        self.assertEqual(result["results"], [finished, recovered, invalid])
+        self.assertEqual(result["results"], [dict(row, request_index=i, request_id=i)
+                                             for i, row in enumerate((finished, recovered, invalid))])
         self.assertEqual(result["serial_retries"], 1)

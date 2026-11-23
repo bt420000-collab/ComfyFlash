@@ -2,8 +2,11 @@
   "comfyui_root": "D:/ComfyUI/ComfyUI",
   "comfyui_models_path": "D:/ComfyUI/ComfyUI/models",
   "device": "cuda:0",
+  "auto_schedule": false,
   "dynamic_vram": true,
   "vram_headroom_gb": 0.1,
+  "video_decode_offload": false,
+  "telemetry_enabled": true,
   "rsi_enabled": true,
   "rsi_db_path": "RSI/data/comfyflash.sqlite3"
 }

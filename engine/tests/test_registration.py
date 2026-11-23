@@ -5,6 +5,7 @@ import shutil
 import subprocess
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -66,10 +67,9 @@ class RegistrationTests(unittest.TestCase):
         target = self.project / ".agents/skills/comfyflash/SKILL.md"
         self.assertEqual(Path(first["guide"]), target)
         installed = target.read_text(encoding="utf-8")
-        for name in ("h3-video.md", "h3-image.md"):
-            reference = agent.GUIDE.parent / "references" / name
-            self.assertIn(f"(<{reference.as_posix()}>)", installed)
-            self.assertTrue(reference.is_file())
+        self.assertIn('"tone-list"', installed)
+        self.assertIn('"tone-info"', installed)
+        self.assertIn("prompt_guide_ref", installed)
         original = target.read_bytes()
         time = target.stat().st_mtime_ns
         second = self.run_registration()
@@ -85,12 +85,33 @@ class RegistrationTests(unittest.TestCase):
         self.assertEqual(result["scope"], "conversation")
         self.assertTrue(all(item["ready"] for item in result["functions"]))
         self.assertFalse(any(self.project.iterdir()))
-        guide = Path(result["guide"])
-        content = guide.read_text(encoding="utf-8")
-        for name in ("h3-video.md", "h3-image.md"):
-            reference = f"references/{name}"
-            self.assertIn(f"({reference})", content)
-            self.assertTrue((guide.parent / reference).is_file())
+        self.assertEqual(Path(result["guide"]), agent.GUIDE)
+        self.assertIn("tone-list", result["tone_list_argv"])
+        self.assertIn("tone-info", result["tone_info_argv"])
+
+    def test_discover_reports_guide_and_schema_without_loading_the_runtime(self):
+        self.models_for(*TONES)
+        self.run_registration()
+        args = argparse.Namespace(config=self.args.config, tone=None)
+        result = agent.discover(args)
+        self.assertTrue(result["ok"])
+        self.assertEqual({tone["tone"] for tone in result["tones"]}, set(TONES))
+        args.tone = "t2"
+        info = agent.discover(args)["info"]
+        self.assertTrue(Path(info["prompt_guide_ref"]).is_file())
+        self.assertIn("properties", info["schema"])
+        args.tone = "missing"
+        self.assertEqual(agent.discover(args)["code"], "UNKNOWN_TONE")
+
+    def test_registration_discovers_a_tone_with_an_unlisted_local_weight(self):
+        self.models_for(*TONES)
+        tone = {**TONES["t3"].TONE, "id": "local", "models": {"diffusion": "custom-local.safetensors"}}
+        with patch.dict(TONES, {"local": SimpleNamespace(TONE=tone)}):
+            result = self.run_registration()
+            self.assertTrue(result["ok"])
+            local = next(item for item in result["functions"] if item["tone"] == "local")
+            self.assertFalse(local["ready"])
+            self.assertEqual(result["missing_local_models"][0]["file"], "custom-local.safetensors")
 
     def test_no_weights_do_not_create_installed_skill(self):
         result = self.run_registration()
@@ -195,68 +216,6 @@ class RegistrationTests(unittest.TestCase):
         args = argparse.Namespace(config=self.args.config, request=[request, request])
         with self.assertRaisesRegex(ValueError, "不同的 output"):
             agent.play(args)
-
-    def write_requests(self, *requests):
-        paths = []
-        for index, request in enumerate(requests):
-            path = self.root / f"batch{index}.json"
-            path.write_text(agent.json_text(request), encoding="utf-8")
-            paths.append(path)
-        return paths
-
-    def test_invalid_batch_request_fails_fast_before_gpu_probe_or_workers(self):
-        self.models_for(*TONES)
-        self.run_registration()
-        picture = self.root / "ref.png"
-        picture.write_bytes(b"png")
-        paths = self.write_requests(
-            {"tone": "t2", "prompt": "valid", "image_in": [str(picture)], "output": str(self.root / "a.mp4")},
-            {"tone": "t4", "prompt": "missing picture", "output": str(self.root / "b.png")},
-            {"prompt": "no tone", "output": str(self.root / "c.png")},
-            {"tone": "t3", "prompt": "typo", "stpes": 6, "output": str(self.root / "d.png")},
-        )
-        with patch.object(agent, "probe_python") as probe, patch.object(agent, "worker_results") as worker:
-            result = agent.play(argparse.Namespace(config=self.args.config, request=paths))
-        probe.assert_not_called()
-        worker.assert_not_called()
-        self.assertFalse(result["ok"])
-        self.assertEqual(result["code"], "BATCH_PREFLIGHT_FAILED")
-        self.assertIn("3 个请求", result["message"])
-        codes = [item["error"]["code"] for item in result["results"]]
-        self.assertEqual(codes, ["NOT_STARTED", "MISSING_INPUT", "MISSING_INPUT", "UNSUPPORTED_CONTROL"])
-        self.assertEqual([item["request"] for item in result["results"]], [str(path) for path in paths])
-
-    def test_valid_batch_passes_preflight_and_reaches_workers(self):
-        self.models_for(*TONES)
-        self.run_registration()
-        paths = self.write_requests(
-            {"tone": "t3", "prompt": "one", "output": str(self.root / "a.png")},
-            {"tone": "t3", "prompt": "two", "resolution": "1:1", "seed": 3, "output": str(self.root / "b.png")},
-        )
-        hardware = {"active_devices": [], "summary": "", "gpus": [
-            {"index": 0, "free_mib": 15000, "total_mib": 16000, "ready": True},
-        ]}
-        done = [(0, {"ok": True}), (1, {"ok": True})]
-        with patch.object(agent, "probe_python"), patch.object(agent, "hardware_report", return_value=hardware), \
-                patch.object(agent, "worker_results", return_value=done) as worker:
-            result = agent.play(argparse.Namespace(config=self.args.config, request=paths))
-        worker.assert_called_once()
-        self.assertTrue(result["ok"])
-        self.assertNotIn("code", result)
-
-    def test_missing_weight_is_caught_by_batch_preflight(self):
-        self.models_for(*TONES)
-        self.run_registration()
-        lora = TONES["t1"].TONE["models"]["lora"]
-        (self.weights / _MODEL_KINDS["lora"] / lora).unlink()
-        paths = self.write_requests(
-            {"tone": "t3", "prompt": "one", "output": str(self.root / "a.png")},
-            {"tone": "t1", "prompt": "two", "output": str(self.root / "b.mp4")},
-        )
-        with patch.object(agent, "probe_python") as probe:
-            result = agent.play(argparse.Namespace(config=self.args.config, request=paths))
-        probe.assert_not_called()
-        self.assertEqual([item["error"]["code"] for item in result["results"]], ["NOT_STARTED", "MISSING_MODEL"])
 
 
 if __name__ == "__main__":

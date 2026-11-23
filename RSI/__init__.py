@@ -1,9 +1,5 @@
-"""ComfyFlash Recursive Self-Improvement (RSI) memory.
+"""Local execution history, Agent feedback, and reviewed improvement evidence."""
 
-The RSI package is deliberately local and on-demand: SQLite is opened only for
-individual operations. It starts no service, daemon, worker, or background task.
-"""
+from .store import DEFAULT_DB_PATH, RSIStore, RSIStoreError
 
-from .store import RSIStore, RSIStoreError
-
-__all__ = ["RSIStore", "RSIStoreError"]
+__all__ = ["DEFAULT_DB_PATH", "RSIStore", "RSIStoreError"]

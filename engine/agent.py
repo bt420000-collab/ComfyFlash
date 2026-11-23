@@ -12,16 +12,21 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 from tempfile import NamedTemporaryFile
 
 ROOT = Path(__file__).resolve().parents[1]
 if not __package__:
     sys.path.insert(0, str(ROOT))
 
-from engine import Flash
-from engine.core import DEFAULT_CONFIG, load_config
+from engine import Flash, __version__, media, telemetry
+from engine.artifact import output_paths
+from engine.bank import TONES
+from engine.core import DEFAULT_CONFIG, ParamError, load_config
+from engine.device_profile import build_device_profiles, decide_device, nvidia_telemetry
 from engine.setup_checks import (
-    ARTIFACTS, INSTALL_GUIDE, MODEL_LICENSES, choose_python, download_space, download_weight,
+    ARTIFACTS, BATCH_FREE_RAM_MIB, BATCH_FREE_VRAM_MIB, INSTALL_GUIDE, MODEL_LICENSES,
+    choose_python, download_space, download_weight,
     hardware_report, model_issue, probe_python,
 )
 
@@ -138,16 +143,40 @@ def check_models(settings):
             for model in flash.tone_info(tone["tone"])["models"]:
                 path = Path(model["path"]).expanduser().resolve()
                 if path not in checked:
-                    entry = ARTIFACTS[model["file"]]
-                    checked[path] = model_issue(path, entry)
+                    entry = ARTIFACTS.get(model["file"])
+                    if entry is not None:
+                        checked[path] = model_issue(path, entry)
+                    else:
+                        checked[path] = None if path.is_file() else "missing_local"
                     if checked[path]:
-                        problems[path] = {**entry, "path": str(path), "file": model["file"],
+                        problems[path] = {**(entry or {}), "path": str(path), "file": model["file"],
                                           "issue": checked[path], "tones": []}
                 if checked[path]:
                     absent.append(str(path))
                     problems[path]["tones"].append(tone["tone"])
             functions.append({**tone, "ready": not absent, "missing": absent})
     return functions, list(problems.values())
+
+
+def discover(args):
+    configured = args.config is not None or DEFAULT_CONFIG.is_file()
+    config = args.config if configured else {"comfyui_root": str(ROOT)}
+    with Flash(config=config) as flash:
+        if args.tone is None:
+            return {"ok": True, "configured": configured, "tones": flash.tone_list()}
+        try:
+            info = flash.tone_info(args.tone)
+        except ParamError as exc:
+            return {"ok": False, "code": exc.code, "message": str(exc)}
+        if info.get("prompt_guide_ref"):
+            info["prompt_guide_ref"] = str((ROOT / info["prompt_guide_ref"]).resolve())
+        return {"ok": True, "configured": configured, "info": info}
+
+
+def preflight(args):
+    request = read_json(args.request.expanduser())
+    with Flash(config=args.config) as flash:
+        return flash.preflight(**request)
 
 
 def project_skill(args):
@@ -206,20 +235,30 @@ def exclude_skill_from_git(project, skill):
 def register(args):
     skill = project_skill(args)
     config, original, settings, comfy, comfy_issue = setup_settings(args)
-    functions, missing = check_models(settings)
+    functions, problems = check_models(settings)
+    missing = [item for item in problems if "url" in item]
+    missing_local = [item for item in problems if "url" not in item]
     runtime = choose_python(comfy, args.python or settings.get("python"))
     if not args.python and settings.get("python") and (
         not runtime["ready"] or not any(gpu["ready"] for gpu in runtime["gpus"])
     ):
         runtime = choose_python(comfy, None)
-    hardware = hardware_report(runtime, settings.get("device"), inventory=True)
+    if getattr(args, "auto_schedule", False):
+        settings["auto_schedule"] = True
+    hardware = hardware_report(runtime, settings.get("device"), inventory=True,
+                               allow_parallel=settings.get("auto_schedule") is True)
+    if hardware["device"] and settings.get("auto_schedule") is not True:
+        pin = settings.get("device", f"cuda:{hardware['device']['index']}")
+        hardware["summary"] += f" 当前配置固定使用 {pin}。"
     environment_ready = bool(comfy and runtime["ready"] and hardware["device"])
     for item in functions:
         item["models_ready"] = item["ready"]
         item["ready"] = item["models_ready"] and environment_ready
     result = {"ok": False, "config": str(config), "functions": functions, "python": runtime,
               "hardware": hardware, "comfyui_root": str(comfy) if comfy else None}
-    if missing or not environment_ready:
+    if missing_local:
+        result["missing_local_models"] = missing_local
+    if missing or not environment_ready or not any(item["ready"] for item in functions):
         needs_cuda_build = hardware["detected_gpu_count"] > 0 and not runtime.get("cuda")
         result.update(
             code="MISSING_MODELS" if environment_ready else "ENVIRONMENT_NOT_READY",
@@ -242,7 +281,8 @@ def register(args):
         return result
 
     python = runtime["path"]
-    settings.update(python=python, device=f"cuda:{hardware['device']['index']}")
+    settings["python"] = python
+    settings.setdefault("device", f"cuda:{hardware['device']['index']}")
     verified = hardware["device"].get("video_acceleration", {})
     video_acceleration = {}
     for option in ("sage_attention", "fp16_accumulation"):
@@ -250,24 +290,26 @@ def register(args):
             settings.setdefault(option, True)
         video_acceleration[option] = bool(settings.get(option, False))
     argv = [str(python), "-B", str(ENTRY), "play", "--config", str(config)]
+    discovery = {
+        "tone_list_argv": [str(python), "-B", str(ENTRY), "tone-list", "--config", str(config)],
+        "tone_info_argv": [str(python), "-B", str(ENTRY), "tone-info", "--config", str(config)],
+    }
     if skill:
         skill = project_skill(args)
         exclude_skill_from_git(args.project.expanduser().resolve(), skill)
         source = GUIDE.read_text(encoding="utf-8")
-        for name in ("h3-video.md", "h3-image.md"):
-            relative = f"references/{name}"
-            source = source.replace(f"({relative})", f"(<{(GUIDE.parent / relative).as_posix()}>)")
         skill_text = source.rstrip() + "\n\n" + MANAGED + "\n\n"
         skill_text += "## 本项目调用配置\n\n"
         skill_text += "把下列数组作为执行参数，在末尾追加 `--request` 和请求 JSON 的绝对路径。\n\n"
         skill_text += "```json\n" + json_text(argv) + "```\n"
+        skill_text += "\n能力发现命令：\n\n```json\n" + json_text(discovery) + "```\n"
     if settings != original or not config.is_file():
         write_text(config, json_text(settings))
     if skill:
         if not skill.exists() or skill.read_text(encoding="utf-8") != skill_text:
             write_text(skill, skill_text)
 
-    names = "、".join(f"{item['tone']} {item['name']}" for item in functions)
+    names = "、".join(f"{item['tone']} {item['name']}" for item in functions if item["ready"])
     scope = "项目和当前对话" if skill else "当前对话"
     return {
         **result, "ok": True,
@@ -277,6 +319,7 @@ def register(args):
         "local_render": LOCAL_RENDER,
         "video_acceleration": video_acceleration,
         "play_argv": argv,
+        **discovery,
         "guide": str(skill or GUIDE),
     }
 
@@ -290,7 +333,7 @@ def download_models(args):
     _, missing = check_models(settings)
     downloaded = []
     for entry in missing:
-        if download_weight(entry):
+        if "url" in entry and download_weight(entry):
             downloaded.append(entry["path"])
     return {"ok": True, "downloaded": downloaded, "message": "运行 register 重新检查并注册。"}
 
@@ -304,15 +347,95 @@ def device_mask(index, inherited):
     return tokens[index].strip()
 
 
-def render_requests(config, requests, report=None):
-    with Flash(config=config) as flash:
+def request_path(value):
+    if not isinstance(value, str) or not value or "\0" in value:
+        return None
+    try:
+        return Path(value).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def output_bundle(path):
+    return output_paths(path, "video" if path.suffix.lower() in media.VIDEO_EXT else "image").values()
+
+
+def reference_paths(request):
+    value = request.get("image_in")
+    for reference in value if isinstance(value, list) else (value,):
+        path = reference.get("path") if isinstance(reference, dict) else reference
+        if resolved := request_path(path):
+            yield resolved
+
+
+def preflight_requests(config, requests):
+    """在任何 GPU Worker 启动前，使用 Flash 的同一套规则预检整批请求。"""
+    validations = []
+    failures = {}
+    try:
+        with Flash(config=config) as flash:
+            planned_images = {}
+            for position, request in enumerate(requests):
+                try:
+                    if not isinstance(request, dict):
+                        raise ParamError("BAD_REQUEST", f"第 {position + 1} 个请求必须是 JSON 对象")
+                    validation = flash.validate_request(**request, _planned_images=planned_images)
+                    output = Path(validation["output"]).resolve()
+                    if output.suffix.lower() in media.IMAGE_EXT:
+                        planned_images[output] = (validation["width"], validation["height"])
+                    elif output.suffix.lower() in media.VIDEO_EXT:
+                        tail = output_paths(output, "video")["last_frame"]
+                        planned_images[tail] = (validation["width"], validation["height"])
+                    validations.append(validation)
+                except ParamError as exc:
+                    failures[position] = {"ok": False, "tone": request.get("tone") if isinstance(request, dict) else None,
+                                          "error": {"code": exc.code, "message": str(exc)}}
+                except TypeError as exc:
+                    failures[position] = {"ok": False, "tone": request.get("tone") if isinstance(request, dict) else None,
+                                          "error": {"code": "BAD_REQUEST", "message": str(exc)}}
+                except (OSError, ValueError) as exc:
+                    failures[position] = {"ok": False, "tone": request.get("tone") if isinstance(request, dict) else None,
+                                          "error": {"code": "PRECHECK_ERROR", "message": str(exc)}}
+                else:
+                    continue
+                validations.append(None)
+    except Exception as exc:
+        message = f"批量预检无法初始化配置：{type(exc).__name__}: {exc}"
+        return {"ok": False, "results": [
+            {"ok": False, "error": {"code": "PRECHECK_ERROR", "message": message}}
+            for _ in requests
+        ], "validations": []}
+
+    if failures:
+        failed_positions = ", ".join(str(position + 1) for position in sorted(failures))
         results = []
+        for position in range(len(requests)):
+            results.append(failures.get(position) or {
+                "ok": False,
+                "tone": requests[position].get("tone") if isinstance(requests[position], dict) else None,
+                "error": {"code": "BATCH_ABORTED", "message": f"整批未执行：第 {failed_positions} 个请求未通过预检"},
+            })
+        return {"ok": False, "results": results, "validations": [],
+                "failed_positions": sorted(position + 1 for position in failures)}
+    return {"ok": True, "results": [], "validations": validations}
+
+
+def render_requests(config, requests, report=None):
+    with Flash(config=config, _persist_history=False) as flash:
+        results = []
+        failed_outputs = set()
         for position, request in enumerate(requests):
-            try:
-                result = flash.play(**request)
-            except TypeError as exc:
-                result = {"ok": False, "error": {"code": "BAD_REQUEST", "message": str(exc)}}
+            missing = next((path for path in reference_paths(request) if path in failed_outputs), None)
+            if missing is not None:
+                result = {"ok": False, "error": {"code": "DEPENDENCY_FAILED", "message": f"Input failed: {missing}"}}
+            else:
+                try:
+                    result = flash.play(**request)
+                except TypeError as exc:
+                    result = {"ok": False, "error": {"code": "BAD_REQUEST", "message": str(exc)}}
             results.append(result)
+            if not result["ok"] and (output := request_path(request.get("output"))) is not None:
+                failed_outputs.update(output_bundle(output))
             if report:
                 report(position, result)
                 if host_buffer_error(result.get("error", {}).get("message", "")):
@@ -376,31 +499,150 @@ def worker_results(args, requests, index, *, safe_memory=False):
             for (position, _), result in zip(requests, results)]
 
 
-def most_free_device(hardware):
-    usable = (gpu for gpu in hardware["gpus"] if gpu["ready"])
-    return max(usable, key=lambda gpu: (gpu["free_mib"], gpu["total_mib"]), default=None)
+def schedule(config, hardware, profiles, count, dependent=False):
+    configured = config.get("device", "cuda:0")
+    inherited = os.getenv("CUDA_VISIBLE_DEVICES", "")
+    preferred = "cuda:0" if inherited.strip() and "," not in inherited else configured
+    requested_auto = config.get("auto_schedule") is True
+    if "device" in config and not requested_auto:
+        decision = decide_device(profiles, preferred=preferred)
+        if preferred != configured:
+            decision["configured_device"] = configured
+            if decision["selected_device"]:
+                decision["decision_reason"] = "inherited_single_device"
+        return [decision], 0
+
+    active = hardware.get("active_devices", [])
+    seats, delay = admit_workers(min(count, len(active)), hardware.get("free_ram_mib"))
+    if seats > 1 and not dependent:
+        decisions = []
+        remaining = set(active)
+        for _ in range(seats):
+            decision = decide_device(profiles, preferred=preferred, auto_schedule=True, candidate_indices=remaining,
+                                     min_free_vram_mib=BATCH_FREE_VRAM_MIB, min_free_ram_mib=BATCH_FREE_RAM_MIB)
+            selected = decision["selected_device"]
+            if selected is None:
+                break
+            decisions.append(decision)
+            remaining.remove(int(selected.split(":")[1]))
+        if len(decisions) > 1:
+            return decisions, delay
+
+    thresholds = {"min_free_vram_mib": BATCH_FREE_VRAM_MIB, "min_free_ram_mib": BATCH_FREE_RAM_MIB} if requested_auto else {}
+    single = decide_device(profiles, preferred=preferred, auto_schedule=True, **thresholds)
+    if single["selected_device"] is not None and count > 1:
+        single.update(decision_reason="dependency_order" if dependent else "parallel_resources_unavailable",
+                      fallback_used=True)
+    return [single], 0
 
 
-def batch_result(results, devices):
-    return {"ok": all(result["ok"] for result in results), "parallel": len(devices) > 1,
-            "devices": [f"cuda:{index}" for index in devices], "results": results}
+def attempt_record(request, result, index, number, profiles, inventory, initial=None):
+    record = result.get("telemetry") or telemetry.worker_attempt(request, result)
+    identifier = request.get("request_id")
+    record["request_id"] = telemetry.request_identifier(identifier) or index
+    record["request_index"] = index
+    record["attempt_index"] = number
+    record["recovered_by_retry"] = bool(number and result["ok"])
+    record["retry_of"] = initial["attempt_id"] if initial is not None else None
+    info = record["device_info"]
+    actual = str(info.get("uuid") or "").lower().removeprefix("gpu-")
+    reported = result.get("device")
+    profile = next((item for item in profiles if item["device"] == reported), {})
+    sample = next((item for item in inventory if actual and item["uuid"].lower().removeprefix("gpu-") == actual), {})
+    if sample:
+        info.update(uuid=sample["uuid"], driver_version=sample.get("driver_version"),
+                    admission_gpu_utilization_pct=profile.get("utilization_pct"))
+    elif not actual and profile.get("uuid"):
+        info.update(uuid=profile["uuid"], name=profile["name"], driver_version=profile["driver_version"],
+                    assignment_only=True)
+    if info.get("uuid"):
+        stable = {key: info.get(key) for key in ("uuid", "name", "driver_version", "compute_capability",
+                                                "total_vram_bytes", "comfyui", "torch", "cuda")}
+        record["device_fingerprint"] = telemetry.fingerprint(stable)
+    return record
 
 
-def preflight_batch(config, requests, paths):
-    """Validate every request before probing GPUs or starting workers; None means all passed."""
-    with Flash(config=config) as flash:
-        errors = [flash._preflight(**request) for request in requests]
-    failed = sum(error is not None for error in errors)
-    if not failed:
-        return None
-    skipped = {"code": "NOT_STARTED", "message": "同批其他请求未通过参数检查，本请求未生成。"}
-    results = [
-        {"ok": False, "file": None, "tone": request.get("tone"), "request": str(path),
-         "error": error or skipped}
-        for request, error, path in zip(requests, errors, paths)
-    ]
-    return {**batch_result(results, []), "code": "BATCH_PREFLIGHT_FAILED",
-            "message": f"{failed} 个请求未通过参数检查，整批未启动。修正后重新提交整批。"}
+def finish_cli(result, config, records, requests, rows):
+    by_position = {record["request_index"]: record for record in records}
+    legacy = []
+    row_ids = []
+    for position, (request, row) in enumerate(zip(requests, rows)):
+        record = by_position.get(position) or (records[-1] if len(rows) == 1 else None)
+        if record is None:
+            continue
+        module = TONES.get(record["tone"])
+        legacy.append(telemetry.legacy_execution(record, row, request, module.TONE if module else None))
+        row_ids.append((request, row, record["attempt_id"]))
+    path, warnings, linked = telemetry.persist(config, records, legacy)
+    for request, row, attempt_id in row_ids:
+        if attempt_id in linked:
+            row["run_id"] = attempt_id
+        if path and not request.get("verbose") and isinstance(row.get("telemetry"), dict):
+            record = row["telemetry"]
+            row["telemetry"] = {key: record[key] for key in ("attempt_id", "status", "failure_stage")}
+    return telemetry.add_receipt(result, path, warnings)
+
+
+def batch_result(results, devices, *, parallel_reason=None, device_decisions=None):
+    result = {"ok": all(result["ok"] for result in results), "parallel": len(devices) > 1,
+              "devices": [f"cuda:{index}" for index in devices], "results": results}
+    if parallel_reason:
+        result["parallel_reason"] = parallel_reason
+    if device_decisions is not None:
+        result["device_decisions"] = device_decisions
+    return result
+
+
+def identified_results(requests, results):
+    rows = []
+    for position, (request, result) in enumerate(zip(requests, results)):
+        identifier = request.get("request_id")
+        rows.append({**result, "request_index": position,
+                     "request_id": identifier if isinstance(identifier, str) and identifier.strip() else position})
+    return rows
+
+
+def batch_layout(requests, workers):
+    """Favor model reuse only for similar work, so a heavy queue does not strand another GPU."""
+    order = [list(range(slot, len(requests), workers)) for slot in range(workers)]
+    if workers == 1:
+        return order
+    groups = {}
+    workloads = set()
+    for position, request in enumerate(requests):
+        tone = TONES.get(str(request.get("tone")))
+        if tone is None:
+            return order
+        spec = tone.TONE
+        controls = spec["controls"]
+        resolution = request.get("resolution") or controls["resolution"]["default"]
+        duration = request.get("duration") or controls.get("duration", {}).get("default")
+        if str(resolution).lower() == "match":
+            return order
+        workloads.add((spec["output"], str(resolution), str(duration)))
+        if len(workloads) > 1:
+            return order
+        fingerprint = (spec["id"], tuple(sorted(spec.get("models", {}).items())),
+                       str(request.get("lora_strength", spec.get("advanced", {}).get("lora_strength", {}).get("default"))))
+        groups.setdefault(fingerprint, []).append(position)
+    grouped = [index for group in sorted(groups.values(), key=len, reverse=True) for index in group]
+    queues = []
+    offset = 0
+    for queue in order:
+        end = offset + len(queue)
+        queues.append(grouped[offset:end])
+        offset = end
+    return queues
+
+
+def admit_workers(available, free_ram_mib):
+    """Use a conservative per-worker host budget, with staggered starts near the limit."""
+    if available < 2 or free_ram_mib is None:
+        return available, 0
+    budget_mib = 12 * 1024
+    workers = min(available, max(1, free_ram_mib // budget_mib))
+    delay_s = 5 if workers > 1 and free_ram_mib < workers * 18 * 1024 else 0
+    return workers, delay_s
 
 
 def play(args):
@@ -415,35 +657,85 @@ def play(args):
             config.setdefault("disable_pinned_memory", True)
         results = render_requests(config, requests, report_worker_result)
         return batch_result(results, [])
-    if len(requests) == 1:
-        device = load_config(args.config).get("device", "cuda:0")
-        inherited = os.getenv("CUDA_VISIBLE_DEVICES")
-        if device.startswith("cuda:") and inherited and "," in inherited:
-            os.environ["CUDA_VISIBLE_DEVICES"] = device_mask(int(device.split(":")[1]), inherited)
-        return render_requests(args.config, requests)[0]
-    outputs = [Path(request["output"]).expanduser().resolve() for request in requests if request.get("output")]
-    if len(outputs) != len(requests) or len(set(outputs)) != len(outputs):
-        raise ValueError("批量请求必须各有一个不同的 output 路径。")
-    rejected = preflight_batch(args.config, requests, paths)
-    if rejected:
-        return rejected
+    has_dependencies = False
+    if len(requests) > 1:
+        outputs = [(position, path) for position, request in enumerate(requests)
+                   if (path := request_path(request.get("output"))) is not None]
+        if len({path for _, path in outputs}) != len(outputs):
+            raise ValueError("批量请求必须各有一个不同的 output 路径。")
+        reserved = [(path, position) for position, output in outputs for path in output_bundle(output)]
+        producers = dict(reserved)
+        if len(reserved) != len(producers):
+            raise ValueError("批量输出路径与另一个请求的媒体旁车冲突。")
+        explicit_ids = [value for request in requests if isinstance(value := request.get("request_id"), str) and value.strip()]
+        if len(explicit_ids) != len(set(explicit_ids)):
+            raise ValueError("同一批次的 request_id 必须唯一。")
+        links = [(position, producers[path]) for position, request in enumerate(requests)
+                 for path in reference_paths(request) if path in producers and producers[path] != position]
+        if any(consumer < producer for consumer, producer in links):
+            raise ValueError("批量请求请先生成依赖素材，再提交使用该素材的请求。")
+        has_dependencies = bool(links)
     cfg = load_config(args.config)
     preferred = cfg.get("device", "cuda:0")
+    dry_run = bool(getattr(args, "dry_run", False))
+    if dry_run or len(requests) > 1 or cfg.get("auto_schedule") is True:
+        checked = preflight_requests(cfg, requests)
+        if dry_run:
+            return {**checked, "dry_run": True, "failed_positions": checked.get("failed_positions", [])}
+        if not checked["ok"]:
+            results = identified_results(requests, checked["results"]) if len(requests) > 1 else checked["results"]
+            batch = (batch_result(results, [], parallel_reason="批量预检未通过，未派发 GPU Worker。")
+                     if len(results) > 1 else results[0])
+            records = [attempt_record(request, row, i, 0, [], []) for i, (request, row) in enumerate(zip(requests, results))]
+            for record in records:
+                record["failure_stage"] = "preflight"
+            return finish_cli(batch, cfg, records, requests, results)
+    # Keep the launcher's existing CUDA mask and direct path unless auto selection was requested.
+    if len(requests) == 1 and (cfg.get("auto_schedule") is not True or preferred == "cpu"):
+        inherited = os.getenv("CUDA_VISIBLE_DEVICES")
+        if preferred.startswith("cuda:") and inherited and "," in inherited:
+            os.environ["CUDA_VISIBLE_DEVICES"] = device_mask(int(preferred.split(":")[1]), inherited)
+        result = render_requests(cfg, requests)[0]
+        inventory = nvidia_telemetry() if result.get("telemetry", {}).get("device_info", {}).get("uuid") else []
+        record = attempt_record(requests[0], result, None, 0, [], inventory)
+        record["device_selection"] = {"decision_reason": "configured_device", "selected_device": preferred}
+        return finish_cli(result, cfg, [record], requests, [result])
     if preferred == "cpu":
-        return batch_result(render_requests(args.config, requests), [])
+        results = render_requests(cfg, requests)
+        records = [attempt_record(request, result, i, 0, [], [])
+                   for i, (request, result) in enumerate(zip(requests, results))]
+        batch = batch_result(identified_results(requests, results), [], parallel_reason="配置指定 CPU 执行。")
+        for record in records:
+            record["device_selection"] = {"decision_reason": "configured_device", "selected_device": preferred}
+        return finish_cli(batch, cfg, records, requests, batch["results"])
     hardware = hardware_report(probe_python(sys.executable, hardware_only=True), preferred)
-    devices = hardware["active_devices"]
-    if len(devices) < 2:
-        best = most_free_device(hardware)
-        if best is None:
-            raise ValueError(hardware["summary"])
-        devices = [best["index"]]
-    devices = devices[:len(requests)]
-    indexed = list(enumerate(paths))
+    inventory = nvidia_telemetry()
+    profiles = build_device_profiles(hardware, inventory=inventory)
+    decisions, delay_s = schedule(cfg, hardware, profiles, len(requests), has_dependencies)
+    devices = [int(d["selected_device"].split(":")[1]) for d in decisions if d["selected_device"]]
+    if not devices:
+        blocked = {"ok": False, "error": {"code": "DEVICE_UNAVAILABLE", "message": hardware.get("summary", "No CUDA device")}}
+        results = [blocked.copy() for _ in requests]
+        batch = (batch_result(identified_results(requests, results), [], parallel_reason="没有满足当前准入条件的设备。",
+                              device_decisions=hardware.get("batch_decisions", [])) if len(requests) > 1 else results[0])
+        batch.update(scheduling=decisions, device_profiles=profiles)
+        records = [attempt_record(request, result, position, 0, profiles, inventory)
+                   for position, (request, result) in enumerate(zip(requests, results))]
+        for record in records:
+            record["device_selection"] = decisions[0]
+        return finish_cli(batch, cfg, records, requests, batch.get("results", results))
+    queues = batch_layout(requests, len(devices))
     with ThreadPoolExecutor(max_workers=len(devices)) as executor:
-        workers = [executor.submit(worker_results, args, indexed[slot::len(devices)], index)
-                   for slot, index in enumerate(devices)]
+        workers = []
+        for slot, (queue, index) in enumerate(zip(queues, devices)):
+            if slot and delay_s:
+                time.sleep(delay_s)
+            workers.append(executor.submit(worker_results, args, [(position, paths[position]) for position in queue], index))
         finished = dict(item for worker in workers for item in worker.result())
+    records = {i: [attempt_record(requests[i], row, i, 0, profiles, inventory)] for i, row in finished.items()}
+    by_device = {decision["selected_device"]: decision for decision in decisions}
+    for position, row in finished.items():
+        records[position][0]["device_selection"] = by_device.get(row.get("device"))
     serial_retries = 0
     safe_memory = False
     retry = []
@@ -457,22 +749,41 @@ def play(args):
             retry.append((position, paths[position]))
     if retry:
         refreshed = hardware_report(probe_python(sys.executable, hardware_only=True), preferred)
-        available = most_free_device(refreshed)
-        if available is not None:
-            finished.update(worker_results(args, sorted(retry), available["index"], safe_memory=safe_memory))
-            serial_retries = len(retry)
-    result = batch_result([finished[position] for position in range(len(paths))], devices)
+        retry_inventory = nvidia_telemetry()
+        retry_profiles = build_device_profiles(refreshed, inventory=retry_inventory)
+        retry_decisions, _ = schedule(cfg, refreshed, retry_profiles, 1)
+        if selected := retry_decisions[0]["selected_device"]:
+            decisions.append({**retry_decisions[0], "serial_retry": True})
+            for position, recovered in worker_results(args, sorted(retry), int(selected.split(":")[1]), safe_memory=safe_memory):
+                first = records[position][0]
+                record = attempt_record(requests[position], recovered, position, 1, retry_profiles,
+                                        retry_inventory, initial=first)
+                record["device_selection"] = decisions[-1]
+                records[position].append(record)
+                finished[position] = recovered
+                serial_retries += 1
+    rows = [finished[position] for position in range(len(paths))]
+    if len(devices) > 1:
+        reason = f"{len(devices)} 张 GPU 满足当前准入条件，独立请求按设备分组执行。"
+    elif has_dependencies:
+        reason = "存在素材依赖，整批在同一设备上按顺序执行。"
+    else:
+        reason = "整批使用单张 GPU，选择依据见 scheduling。"
+    result = (batch_result(identified_results(requests, rows), devices, parallel_reason=reason,
+                           device_decisions=hardware.get("batch_decisions", [])) if len(requests) > 1 else rows[0])
+    result.update(scheduling=decisions, device_profiles=profiles)
     if serial_retries:
         result["serial_retries"] = serial_retries
-    return result
-
+    history = [record for i in range(len(paths)) for record in records[i]]
+    return finish_cli(result, cfg, history, requests, result.get("results", rows))
 
 
 def rsi_command(args):
     """Read or append local RSI records; no service or background process."""
     from RSI import RSIStore
 
-    store = RSIStore(args.db)
+    default = load_config(args.config).get("_rsi_db_path") if not args.db and args.config.is_file() else None
+    store = RSIStore(args.db or default)
     action = args.rsi_action
     if action == "note":
         context = json.loads(args.context_json) if args.context_json else {}
@@ -519,9 +830,22 @@ def rsi_command(args):
     raise ValueError(f"未知 RSI 命令：{action}")
 
 
+
+def xcard_command(args):
+    """Discover Expansion Card tool directories without reading or executing them."""
+    from xcard import XCardCatalog
+
+    catalog = XCardCatalog(args.directory)
+    if args.xcard_action == "list":
+        return catalog.list_tools()
+    if args.xcard_action == "show":
+        return {"ok": True, "tool": catalog.show_tool(args.tool_name)}
+    raise ValueError(f"未知 XCard 命令：{args.xcard_action}")
+
 def main():
     sys.stdout.reconfigure(encoding="utf-8")
     cli = argparse.ArgumentParser(description=__doc__)
+    cli.add_argument("--version", action="version", version=f"ComfyFlash {__version__}")
     actions = cli.add_subparsers(dest="command", required=True)
     setup = actions.add_parser("register", help="检查环境并输出本次注册说明")
     setup.add_argument("--project", type=Path, help="在指定项目中注册技能。省略时用于当前对话")
@@ -529,20 +853,33 @@ def main():
     setup.add_argument("--python", help="推理 Python 的路径")
     setup.add_argument("--comfyui-root", help="设置本机 ComfyUI 目录")
     setup.add_argument("--models-path", help="设置本机模型总目录")
+    setup.add_argument("--auto-schedule", action="store_true", help="允许 CLI 按当前资源自动选择 GPU")
     setup.set_defaults(handler=register)
     download = actions.add_parser("download-models", help="得到用户确认后补齐官方权重")
     download.add_argument("--yes", action="store_true", help="表示用户已经确认下载")
     download.add_argument("--comfyui-root")
     download.add_argument("--models-path")
     download.set_defaults(handler=download_models)
+    tones = actions.add_parser("tone-list", help="读取当前能力目录")
+    tones.set_defaults(handler=discover, tone=None)
+    info = actions.add_parser("tone-info", help="读取指定 Tone 的参数契约及指南")
+    info.add_argument("tone", help="tone-list 返回的 Tone ID")
+    info.set_defaults(handler=discover)
+    for action in (tones, info):
+        action.add_argument("--config", type=Path, help="用于检查本机模型路径的配置")
+    check = actions.add_parser("preflight", help="检查请求和依赖，不加载推理模型")
+    check.add_argument("--request", type=Path, required=True)
+    check.set_defaults(handler=preflight)
     render = actions.add_parser("play", help="从 JSON 请求直接生成")
     render.add_argument("--request", type=Path, action="append", required=True, help="可重复传入多个请求")
     render.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     render.add_argument("--safe-memory", action="store_true", help=argparse.SUPPRESS)
+    render.add_argument("--dry-run", action="store_true", help="只预检请求和模型依赖，不启动 GPU 推理")
     render.set_defaults(handler=play)
 
     rsi = actions.add_parser("rsi", help="记录/查询本地 RSI 运行经验与 Agent 点评")
     rsi.add_argument("--db", type=Path, help="可选的 SQLite 数据库路径")
+    rsi.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help="读取本机配置中的 RSI 路径")
     rsi_actions = rsi.add_subparsers(dest="rsi_action", required=True)
 
     note = rsi_actions.add_parser("note", help="记录 Agent/Human 在工作中的问题或优化点评")
@@ -593,7 +930,16 @@ def main():
     summary = rsi_actions.add_parser("summary", help="查看 RSI 数据库摘要")
     summary.set_defaults(handler=rsi_command)
 
-    for action in (setup, download, render):
+    xcard = actions.add_parser("xcard", help="自动发现 xcard/ 下的独立制作工具目录")
+    xcard.add_argument("--directory", type=Path, help="可选的自定义 XCard 根目录")
+    xcard_actions = xcard.add_subparsers(dest="xcard_action", required=True)
+    xcard_list = xcard_actions.add_parser("list", help="列出自动发现的制作工具目录")
+    xcard_list.set_defaults(handler=xcard_command)
+    xcard_show = xcard_actions.add_parser("show", help="查看工具目录路径和一级文件清单")
+    xcard_show.add_argument("tool_name")
+    xcard_show.set_defaults(handler=xcard_command)
+
+    for action in (setup, download, check, render):
         action.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     args = cli.parse_args()
     try:

@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from RSI import RSIStore, RSIStoreError
+from RSI.store import SCHEMA_VERSION
 from engine import Flash
 from engine.bank import TONES
 
@@ -25,6 +26,8 @@ class RSIStoreTests(unittest.TestCase):
         run_id = self.store.record_run(
             {"ok": True, "tone": "t2", "file": "shot.mp4", "seed": 42, "elapsed_s": 12.5,
              "width": 768, "height": 448, "frames": 39, "duration": 1.625, "fps": 24,
+             "requested_duration_s": 1.6, "decoded_frame_count": 41, "trimmed_frame_count": 2,
+             "actual_frame_count": 39, "audio_report": {"present": True, "sample_rate": 32000},
              "timing_s": {"sampling": 9.1}},
             tone="t2", spec={"output": "video", "models": {"diffusion": "h3.safetensors"}},
             request={"prompt": "a private prompt", "resolution": "768x448", "duration": 1.6,
@@ -102,24 +105,24 @@ class RSIStoreTests(unittest.TestCase):
             "--category", "bug", "--severity", "high", "--author", "codex",
             "--tone", "t2", "--tag", "cli",
         ]
-        created = subprocess.run(command, check=True, capture_output=True, text=True)
+        created = subprocess.run(command, check=True, capture_output=True, encoding="utf-8")
         import json
         feedback_id = json.loads(created.stdout)["feedback"]["feedback_id"]
         listed = subprocess.run(
             [sys.executable, "-B", str(script), "rsi", "--db", str(self.db_path),
              "list", "--status", "open", "--tone", "t2"],
-            check=True, capture_output=True, text=True,
+            check=True, capture_output=True, encoding="utf-8",
         )
         self.assertEqual(json.loads(listed.stdout)["feedback"][0]["feedback_id"], feedback_id)
         updated = subprocess.run(
             [sys.executable, "-B", str(script), "rsi", "--db", str(self.db_path),
              "update", feedback_id, "--status", "planned", "--resolution", "准备下一轮处理"],
-            check=True, capture_output=True, text=True,
+            check=True, capture_output=True, encoding="utf-8",
         )
         self.assertEqual(json.loads(updated.stdout)["feedback"]["status"], "planned")
         shown = subprocess.run(
             [sys.executable, "-B", str(script), "rsi", "--db", str(self.db_path), "show", feedback_id],
-            check=True, capture_output=True, text=True,
+            check=True, capture_output=True, encoding="utf-8",
         )
         self.assertEqual(json.loads(shown.stdout)["feedback"]["resolution"], "准备下一轮处理")
 
@@ -132,7 +135,7 @@ class RSIStoreTests(unittest.TestCase):
                 [sys.executable, "-B", str(script), "rsi", "--db", str(self.db_path),
                  "note", "--title", f"worker-{index}", "--observation", "parallel process write",
                  "--author", f"agent-{index}"],
-                check=True, capture_output=True, text=True,
+                check=True, capture_output=True, encoding="utf-8",
             )
 
         with ThreadPoolExecutor(max_workers=4) as pool:
@@ -141,6 +144,7 @@ class RSIStoreTests(unittest.TestCase):
         self.assertEqual(len(self.store.list_feedback(limit=20)), 4)
 
     def test_database_uses_wal_and_rejects_oversized_context(self):
+        self.store.initialize()
         with closing(sqlite3.connect(self.db_path)) as db:
             journal_mode = db.execute("PRAGMA journal_mode").fetchone()[0]
         self.assertEqual(journal_mode.lower(), "wal")
@@ -152,7 +156,7 @@ class RSIStoreTests(unittest.TestCase):
     def test_summary_reports_schema_and_open_feedback(self):
         self.store.add_feedback(title="one", observation="observation")
         summary = self.store.summary()
-        self.assertEqual(summary["schema_version"], 1)
+        self.assertEqual(summary["schema_version"], SCHEMA_VERSION)
         self.assertEqual(summary["open_feedback"], 1)
 
 

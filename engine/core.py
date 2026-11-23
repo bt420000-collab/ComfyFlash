@@ -1,6 +1,6 @@
-"""engine.core —— Comfy Flash H3 v0.1 的公共控制、I/O 与执行生命周期。
+"""engine.core —— ComfyFlash 的公共控制、I/O 与执行生命周期。
 
-对外只承诺三个方法：``tone_list()`` / ``tone_info()`` / ``play()``。
+主要入口为 ``tone_list()``、``tone_info()``、``preflight()`` 和 ``play()``。
 
 Engine 负责的"标准控制面板"：
     prompt / image_in / audio_in / resolution / duration / seed / output
@@ -12,6 +12,8 @@ Tone 只负责它自己的配方（模型、LoRA、采样器、条件拼装）�
 from __future__ import annotations
 
 import contextlib
+from functools import lru_cache
+import hashlib
 import io as _io
 import json
 import logging
@@ -21,7 +23,8 @@ import threading
 import time
 from pathlib import Path
 
-from . import h3, media
+from . import artifact, contracts, h3, media, telemetry
+from .contracts import ParamError
 from .bank import TONES
 from .runtime import Runtime
 
@@ -40,15 +43,6 @@ _MODEL_KINDS = {
 # 同进程热复用，但不许把整套模型都攒在内存里：每类最多留几个。
 _CACHE_LIMITS = {"unet": 1, "patched_unet": 1, "clip": 1, "vae": 2, "lora": 2}
 _EXECUTION_LOCK = threading.RLock()
-
-
-class ParamError(Exception):
-    """参数/依赖层面的失败：可预期、可读、不打印堆栈。"""
-
-    def __init__(self, code: str, message: str):
-        super().__init__(message)
-        self.code = code
-        self.message = message
 
 
 # --------------------------------------------------------------------- config
@@ -71,44 +65,64 @@ def resolve_config(settings, path=None) -> dict:
         for key in ("diffusion_models", "text_encoders", "vae", "loras")
     }
     cfg["_path"] = str(path) if path else None
-    cfg["_rsi_enabled"] = bool(cfg.get("rsi_enabled", True))
-    rsi_path = cfg.get("rsi_db_path") or os.getenv("COMFYFLASH_RSI_DB")
-    if rsi_path:
-        rsi_path = Path(rsi_path).expanduser()
-        if not rsi_path.is_absolute():
-            rsi_path = _ROOT / rsi_path
-    else:
-        rsi_path = _ROOT / "RSI" / "data" / "comfyflash.sqlite3"
-    cfg["_rsi_db_path"] = str(rsi_path.resolve())
+    rsi_path = cfg.get("rsi_db_path") or os.getenv("COMFYFLASH_RSI_DB") or "RSI/data/comfyflash.sqlite3"
+    try:
+        cfg["_rsi_db_path"] = str(_ROOT / Path(rsi_path).expanduser())
+    except (TypeError, ValueError, RuntimeError, OSError):
+        cfg["_rsi_db_path"] = rsi_path  # Storage reports invalid config at write time.
     return cfg
 
 
-def _normalize_images(value) -> list[str]:
-    if isinstance(value, (str, Path)):
+def _normalize_images(value, field, planned_images):
+    if isinstance(value, (str, Path, dict)):
         items = [value]
     elif isinstance(value, (list, tuple)):
         items = list(value)
     else:
-        raise ParamError("BAD_INPUT", "image_in 只接受路径字符串或路径列表，收到 {}".format(type(value).__name__))
+        raise ParamError("BAD_INPUT", "image_in requires a path, an image Artifact, or a list of them")
 
-    paths = []
+    minimum, maximum = field["min_items"], field["max_items"]
+    if not minimum <= len(items) <= maximum:
+        raise ParamError("BAD_INPUT_COUNT", f"image_in received {len(items)} images; allowed {minimum}..{maximum}")
+    paths, lineage = [], []
     for item in items:
+        metadata = None
+        if isinstance(item, dict):
+            if item.get("media_type") != "image":
+                raise ParamError("BAD_INPUT", "image_in requires an image Artifact")
+            inspection = item.get("inspection")
+            if isinstance(inspection, dict) and isinstance(inspection.get("metadata"), str):
+                metadata = inspection["metadata"]
+            item = item.get("path")
+        if not isinstance(item, (str, Path)):
+            raise ParamError("BAD_INPUT", "image_in requires path strings")
         p = Path(str(item)).expanduser()
         if not p.is_absolute():
             raise ParamError("BAD_INPUT", "image_in 必须是绝对路径：{}".format(p))
-        if not p.is_file():
+        if p.resolve() not in planned_images and not p.is_file():
             raise ParamError("BAD_INPUT", "找不到输入图片：{}".format(p))
         paths.append(str(p))
-    if not paths:
-        raise ParamError("BAD_INPUT", "image_in 是空的")
-    return paths
+        lineage.append(metadata)
+    return paths, lineage
+
+
+@lru_cache(maxsize=64)
+def _weight_signature(path, size, modified_ns):
+    """Sample model bytes without reading the full checkpoint on each cold run."""
+    digest = hashlib.sha256(str(size).encode("ascii") + b"\0")
+    with path.open("rb") as stream:
+        digest.update(stream.read(65536))
+        if size > 65536:
+            stream.seek(max(65536, size - 65536))
+            digest.update(stream.read(65536))
+    return digest.hexdigest()
 
 
 # ------------------------------------------------------------------ run context
 class _Run:
     """一次生成请求的上下文：模型取用 + 采样 + 解码 + 落盘。"""
 
-    def __init__(self, engine: "Flash", spec: dict, req: dict):
+    def __init__(self, engine: "Flash", spec: dict, req: dict, attempt=None):
         self.engine = engine
         self.rt: Runtime = engine.runtime()
         self.spec = spec
@@ -123,15 +137,15 @@ class _Run:
         self.params = req["advanced"]
         self.meta: dict = {}
         self.video = spec["output"] == "video"
+        self.attempt = attempt or telemetry.Attempt(spec["id"])
+        self._model_details = None
 
     @contextlib.contextmanager
-    def timed_video_stage(self, name):
-        if not self.video:
+    def timed_stage(self, name):
+        with self.attempt.measure(name):
             yield
-            return
-        started = time.perf_counter()
-        yield
-        self.meta.setdefault("timing_s", {})[name] = round(time.perf_counter() - started, 2)
+        if self.video:
+            self.meta.setdefault("timing_s", {})[name] = round(self.attempt.timings[name], 2)
 
     # ---- 模型
     def _path(self, key: str) -> str:
@@ -142,29 +156,33 @@ class _Run:
 
     def unet(self):
         path = self._path("diffusion")
-        return self.engine.cached(("unet", path), self.rt.load_unet, path)
+        with self.attempt.measure("model_load"):
+            return self.engine.cached(("unet", path), self.rt.load_unet, path)
 
     def clip(self):
         path = self._path("text_encoder")
-        return self.engine.cached(("clip", path), self.rt.load_clip, path)
+        with self.attempt.measure("model_load"):
+            return self.engine.cached(("clip", path), self.rt.load_clip, path)
 
     def vae(self, key: str):
         path = self._path(key)
-        return self.engine.cached(("vae", path), self.rt.load_vae, path)
+        with self.attempt.measure("model_load"):
+            return self.engine.cached(("vae", path), self.rt.load_vae, path)
 
     def with_lora(self, model):
         strength = float(self.params.get("lora_strength", 1.0))
         if strength == 0.0:
             return model
         path = self._path("lora")
-        lora = self.engine.cached(("lora", path), self.rt.load_lora, path)
-        return self.engine.cached(
-            ("patched_unet", self._path("diffusion"), path, strength),
-            self.rt.apply_model_lora, model, lora, strength,
-        )
+        with self.attempt.measure("model_load"):
+            lora = self.engine.cached(("lora", path), self.rt.load_lora, path)
+            return self.engine.cached(
+                ("patched_unet", self._path("diffusion"), path, strength),
+                self.rt.apply_model_lora, model, lora, strength,
+            )
 
     def condition(self, build, *args, **kwargs):
-        with self.timed_video_stage("conditioning"), self.rt.stage():
+        with self.timed_stage("conditioning"), self.rt.stage():
             return build(self.rt, *args, **kwargs)
 
     # ---- 采样
@@ -176,7 +194,7 @@ class _Run:
         noise = self.rt.prepare_noise(latent["samples"], self.seed)
         sigmas = h3.PIKA_SIGMAS if p["scheduler"] == "pika" else None
         negative = None if sigmas is not None and p["cfg"] == 1.0 else h3.zero_out(cond)
-        with self.timed_video_stage("sampling"), self.rt.stage():
+        with self.timed_stage("sampling"), self.rt.stage():
             out = self.rt.sample_latent(
                 model,
                 cond,
@@ -194,56 +212,119 @@ class _Run:
 
     # ---- 解码 / 落盘
     def _offload_for_decode(self):
-        """视频解码前先把 20GB 底盘请出显存：解码器只要几 GB，混在一起必 OOM。"""
-        if self.rt.dynamic_vram or getattr(self, "_offloaded", False):
+        """Release model residency before the first decoder while keeping its latents."""
+        if self.rt.dynamic_vram and not self.engine._cfg.get("video_decode_offload", False):
             return
-        self.rt.offload_all()
+        if getattr(self, "_offloaded", False):
+            return
+        with self.attempt.measure("decode_offload"):
+            self.rt.offload_all()
         self._offloaded = True
 
     def decode_frames(self, vae, samples):
         if self.video:
             self._offload_for_decode()
-        with self.timed_video_stage("video_decode"), self.rt.stage():
-            frames = self.rt.decode(vae, samples["samples"])
+        with self.timed_stage("video_decode" if self.video else "image_decode"):
+            with self.rt.stage():
+                frames = self.rt.decode(vae, samples["samples"])
         if frames.dim() == 5:
             frames = frames.reshape(-1, frames.shape[-3], frames.shape[-2], frames.shape[-1])
+        decoded = int(frames.shape[0])
         if self.frames and frames.shape[0] > self.frames:
             frames = frames[: self.frames]
+        if self.video:
+            actual = int(frames.shape[0])
+            self.meta.update(decoded_frame_count=decoded, trimmed_frame_count=decoded - actual,
+                             actual_frame_count=actual)
+            if decoded > actual:
+                self.meta["frames_note"] = f"VAE 解出 {decoded} 帧，截断 {decoded - actual} 帧"
         return frames
 
     def decode_audio(self, vae_audio, samples):
         if self.video:
             self._offload_for_decode()
-        with self.timed_video_stage("audio_decode"), self.rt.stage():
-            return self.rt.decode_audio(vae_audio, samples["samples"])
+        with self.timed_stage("audio_decode"):
+            with self.rt.stage():
+                return self.rt.decode_audio(vae_audio, samples["samples"])
+
+    def model_details(self):
+        if self._model_details is not None:
+            return self._model_details
+        models = []
+        for role in self.spec.get("models", {}):
+            path = Path(self._path(role)).resolve()
+            stat = path.stat()
+            models.append({"role": role, "file": path.name, "path": str(path), "size_bytes": stat.st_size,
+                           "fingerprint_algorithm": "sha256-size-and-edges-64k-v1",
+                           "fingerprint": _weight_signature(path, stat.st_size, stat.st_mtime_ns),
+                           "applied": role != "lora" or self.params.get("lora_strength", 1.0) != 0})
+        self._model_details = models
+        return models
+
+    def _artifact_details(self):
+        models = self.model_details()
+        role = self.spec["inputs"].get("fields", {}).get("image_in", {}).get("role")
+        sources = [{"role": role, "path": path, "metadata": meta}
+                   for path, meta in zip(self.image_paths, self.req["input_artifacts"])]
+        runtime = self.rt.versions()
+        if self.video:
+            runtime.update(self.rt.video_acceleration(), decode_offloaded=getattr(self, "_offloaded", False))
+        sampling = self.meta.get("sampling", {key: self.params[key] for key in ("steps", "sampler", "scheduler", "cfg")
+                                             if key in self.params})
+        return {**self.meta, "tone": self.spec["id"], "tone_version": self.spec.get("version"),
+                "seed": self.seed, "request_id": self.req.get("request_id"), "models": models,
+                "runtime": runtime, "sampling": sampling,
+                "effective_controls": {"prompt": self.prompt, "width": self.width, "height": self.height,
+                                       **self.params},
+                "provenance": {"inputs": sources, "requested_resolution": self.req["resolution"]}}
 
     def save_video(self, frames, audio=None):
-        if frames.dim() == 4 and frames.shape[0] == 1 and self.frames == 1:
-            raise ParamError("BAD_OUTPUT", "t1/t2 产出的帧数异常（只有 1 帧），请检查模型")
-        with self.timed_video_stage("encoding"):
-            path = media.save_video(frames, self.output, fps=h3.FPS, audio=audio)
+        total = int(frames.shape[0])
+        if total < 1:
+            raise ParamError("BAD_OUTPUT", "Video decoder returned zero frames")
+        rate = self.req["fps"]
+        decoded = self.meta.get("decoded_frame_count", total)
         self.meta.update({
-            "width": int(frames.shape[2]),
-            "height": int(frames.shape[1]),
-            "frames": int(frames.shape[0]),
-            "duration": round(frames.shape[0] / h3.FPS, 3),
-            "fps": h3.FPS,
+            "width": int(frames.shape[2]), "height": int(frames.shape[1]),
+            "frames": total, "duration": round(total / rate, 3), "fps": rate,
+            "requested_duration_s": self.req["requested_duration_s"],
+            "requested_frame_count": self.req["requested_frame_count"],
+            "aligned_frame_count": self.frames, "decoded_frame_count": decoded,
+            "trimmed_frame_count": max(0, decoded - total),
+            "actual_frame_count": total, "actual_duration_s": total / rate,
         })
-        return path
+        details = self._artifact_details()
+        legacy_audio = media.audio_summary(audio, total, rate)
+        started = time.perf_counter()
+        with self.attempt.measure("delivery"):
+            delivered = artifact.deliver_video(
+                frames, self.output, details, fps=rate, audio=audio,
+                audio_required=self.spec["outputs"].get("audio_required", False),
+                inspection_frames=self.req["inspection_frames"], overwrite=self.req["overwrite"],
+            )
+        self.meta["timing_s"] = {**delivered["timing_s"], "delivery": round(time.perf_counter() - started, 2)}
+        self.meta["artifact"] = delivered
+        self.meta["validation"] = delivered["validation"]
+        self.meta["audio_report"] = legacy_audio
+        self.meta["inspection"] = {**delivered["inspection"], "source": "decoded_frames_tensor",
+                                   "frame_samples": len(delivered["inspection"]["samples"])}
+        return delivered["path"]
 
     def save_image(self, tensor):
-        path = media.save_image(tensor, self.output)
-        self.meta.update({"width": int(tensor.shape[-2]), "height": int(tensor.shape[-3])})
-        return path
+        with self.attempt.measure("delivery"):
+            delivered = artifact.deliver_image(tensor, self.output, self._artifact_details(), overwrite=self.req["overwrite"])
+        self.meta.update(width=delivered["width"], height=delivered["height"], artifact=delivered)
+        return delivered["path"]
 
 
 # --------------------------------------------------------------------- Flash
 class Flash:
     """四个 Tone 的弹奏入口。同步、单进程、串行。"""
 
-    def __init__(self, config=None, verbose: bool = False):
+    def __init__(self, config=None, verbose: bool = False, *, _persist_history: bool = True):
         self._cfg = resolve_config(config) if isinstance(config, dict) else load_config(config)
         self.verbose = bool(verbose)
+        self._persist_history = _persist_history
         self._rt: Runtime | None = None
         self._cache: dict = {}
         self._tick: dict = {}
@@ -251,28 +332,6 @@ class Flash:
         self._lock = _EXECUTION_LOCK
         self._closed = False
         self._rsi_store = None
-
-    @property
-    def rsi(self):
-        """Lazy access to the local RSI notebook; no connection stays open."""
-        if self._rsi_store is None:
-            from RSI import RSIStore
-            self._rsi_store = RSIStore(self._cfg.get("_rsi_db_path"))
-        return self._rsi_store
-
-    def _record_rsi_run(self, result, tone, spec, request):
-        if not self._cfg.get("_rsi_enabled", True) or request is None or spec is None:
-            return result
-        device = os.getenv("COMFYFLASH_DEVICE_LABEL") or self._cfg.get("device", "cuda:0")
-        result.setdefault("device", device)
-        try:
-            result["run_id"] = self.rsi.record_run(
-                result, tone=tone, spec=spec, request=request, device=device,
-            )
-        except Exception:
-            # RSI is an observability layer, never a dependency of image/video inference.
-            logging.getLogger(__name__).warning("Unable to persist RSI run record", exc_info=True)
-        return result
 
     # ------------------------------------------------------------- 生命周期
     def __enter__(self):
@@ -296,6 +355,14 @@ class Flash:
     @property
     def closed(self) -> bool:
         return self._closed
+
+    @property
+    def rsi(self):
+        """Access the same local notebook used by automatic run summaries."""
+        if self._rsi_store is None:
+            from RSI import RSIStore
+            self._rsi_store = RSIStore(self._cfg["_rsi_db_path"])
+        return self._rsi_store
 
     def runtime(self) -> Runtime:
         if self._closed:
@@ -353,30 +420,35 @@ class Flash:
         out = []
         for tone_id, module in TONES.items():
             spec = module.TONE
-            out.append({
-                "tone": tone_id,
-                "name": spec["name"],
-                "purpose": spec["purpose"],
-                "output": spec["output"],
-                "inputs": spec["inputs"],
-            })
+            fields = spec["inputs"].get("fields", {})
+            row = {k: spec.get(k) for k in ("name", "purpose", "output", "inputs", "schema_version",
+                                             "version", "tags", "capabilities", "hardware_requirements", "latency_class",
+                                             "prompt_format")}
+            row.update(id=tone_id, tone=tone_id, schema_hash=contracts.schema_hash(contracts.request_schema(spec)),
+                       media_inputs=sorted({field["media_type"] for field in fields.values()}),
+                       media_outputs=[spec["output"]] + (["audio"] if spec["outputs"].get("audio_required") else []))
+            out.append(row)
         return out
 
     def tone_info(self, tone: str):
         spec = self._spec(tone)
         info = json.loads(json.dumps(spec, ensure_ascii=False))
+        info["schema"] = contracts.request_schema(info)
+        info["schema_hash"] = contracts.schema_hash(info["schema"])
         deps = []
         for key, name in (spec.get("models") or {}).items():
             kind = _MODEL_KINDS[key]
             path = Path(str(name))
             if not path.is_absolute():
                 path = Path(self._cfg["_dirs"][kind]) / path
+            exists = path.is_file()
             deps.append({
                 "role": key,
                 "dir": kind,
                 "file": path.name,
                 "path": str(path),
-                "exists": path.is_file(),
+                "exists": exists,
+                "status": "available" if exists else "missing",
             })
         info["models"] = deps
         info["models_ready"] = all(item["exists"] for item in deps)
@@ -384,6 +456,36 @@ class Flash:
         return info
 
     # ------------------------------------------------------------- 演奏
+    def _check_models(self, spec):
+        return {key: self.model_path(name, _MODEL_KINDS[key]) for key, name in spec.get("models", {}).items()}
+
+    def validate_request(self, tone=None, prompt=None, image_in=None, audio_in=None, resolution=None,
+                         duration=None, seed=None, output=None, verbose=None, *, _planned_images=None, **advanced):
+        """Validate without importing the runtime, including known earlier batch outputs."""
+        if self._closed:
+            raise ParamError("CLOSED", "Flash 已关闭，请重新 with Flash() 后再调用")
+        spec = self._spec(tone)
+        req = self._resolve(spec, prompt, image_in, audio_in, resolution, duration, seed, output, advanced,
+                            planned_images=_planned_images)
+        paths = self._check_models(spec)
+        summary = {key: req.get(key) for key in ("output", "overwrite", "resolution", "width", "height", "seed",
+                                                 "requested_duration_s", "requested_frame_count", "aligned_frame_count")}
+        return {"ok": True, "tone": tone, "model_paths": paths, **summary}
+
+    def preflight(self, tone, prompt=None, image_in=None, audio_in=None, resolution=None,
+                  duration=None, seed=None, output=None, verbose=None, **advanced):
+        """Resolve a request and check local dependencies without starting inference."""
+        started = time.time()
+        seed_value = None
+        try:
+            spec = self._spec(tone)
+            req = self._resolve(spec, prompt, image_in, audio_in, resolution, duration, seed, output, advanced)
+            seed_value = req["seed"]
+            self._check_models(spec)
+            return {"ok": True, "tone": tone, "resolved": req}
+        except ParamError as exc:
+            return self._fail(tone, seed_value, exc, None, started, exc.code)
+
     def play(
         self,
         tone: str,
@@ -397,18 +499,39 @@ class Flash:
         verbose=None,
         **advanced,
     ):
+        attempt = telemetry.Attempt(tone, advanced.get("request_id"))
+        result = self._play(attempt, tone, prompt, image_in, audio_in, resolution, duration,
+                            seed, output, verbose, advanced)
+        result.setdefault("device", os.getenv("COMFYFLASH_DEVICE_LABEL") or self._cfg.get("device", "cuda:0"))
+        try:
+            record = result["telemetry"] = attempt.finish(result)
+            if self._persist_history:
+                module = TONES.get(str(tone))
+                request = {"prompt": prompt, "image_in": image_in, "output": output}
+                legacy = telemetry.legacy_execution(record, result, request, module.TONE if module else None)
+                path, warnings, linked = telemetry.persist(self._cfg, [record], [legacy])
+                if record["attempt_id"] in linked:
+                    result["run_id"] = record["attempt_id"]
+                for warning in warnings:
+                    if warning["code"] == "RSI_STORAGE_UNAVAILABLE":
+                        logging.getLogger(__name__).warning("Unable to persist RSI run: %s", warning["message"])
+                return telemetry.add_receipt(result, path, warnings)
+        except (OSError, ValueError, TypeError) as exc:
+            telemetry.add_receipt(result, None, [{"code": "TELEMETRY_UNAVAILABLE", "message": str(exc)}])
+        return result
+
+    def _play(self, attempt, tone, prompt, image_in, audio_in, resolution, duration, seed, output,
+              verbose, advanced):
         started = time.time()
         seed_value = None
-        spec = None
-        req = None
         verbose = self.verbose if verbose is None else bool(verbose)
         try:
-            spec = self._spec(tone)
-            req = self._resolve(spec, prompt, image_in, audio_in, resolution, duration, seed, output, advanced)
-            seed_value = req["seed"]
-
-            for key, name in (spec.get("models") or {}).items():
-                self.model_path(name, _MODEL_KINDS[key])
+            with attempt.measure("preflight"):
+                spec = self._spec(tone)
+                req = self._resolve(spec, prompt, image_in, audio_in, resolution, duration, seed, output, advanced)
+                seed_value = req["seed"]
+                attempt.configure(spec, req, self._cfg)
+                self._check_models(spec)
 
             with self._lock:
                 if self._closed:
@@ -416,7 +539,9 @@ class Flash:
                 buf_out, buf_err = _io.StringIO(), _io.StringIO()
                 try:
                     with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
-                        rt = self.runtime()
+                        with attempt.measure("runtime_init"):
+                            rt = self.runtime()
+                            attempt.enter_runtime(rt)
                         with rt.generation():
                             if not rt.dynamic_vram:
                                 reserve = self._cfg.get(
@@ -427,17 +552,29 @@ class Flash:
                                     rt.hard_reset()
                                 else:
                                     rt.offload_all()
-                            run = _Run(self, spec, req)
-                            path = TONES[tone].play(run)
+                            run = _Run(self, spec, req, attempt)
+                            try:
+                                attempt.set_models(run.model_details())
+                            except (OSError, ParamError):
+                                pass  # Path and role remain available when a model can't be signed.
+                            with attempt.measure("generation"):
+                                path = TONES[tone].play(run)
                             meta = dict(run.meta)
                             if run.video:
-                                meta["runtime"] = rt.video_acceleration()
+                                meta["runtime"] = {**rt.video_acceleration(),
+                                                   "decode_offloaded": getattr(run, "_offloaded", False)}
                 except Exception as exc:  # 运行时失败：保留可定位的诊断信息
+                    delivery_failed = isinstance(exc, artifact.DeliveryError)
+                    cause = (exc.__cause__ or exc) if delivery_failed else exc
+                    oom = ((self._rt is not None and self._rt.is_oom(cause))
+                           or "out of memory" in str(cause).lower())
+                    if delivery_failed and not oom:
+                        raise
                     detail = (buf_err.getvalue() or "") + (buf_out.getvalue() or "")
-                    oom = self._rt is not None and self._rt.is_oom(exc)
-                    result = self._fail(tone, seed_value, exc, detail, started, "OOM" if oom else "RUNTIME_ERROR")
+                    result = self._fail(tone, seed_value, cause, detail, started, "OOM" if oom else "RUNTIME_ERROR")
                     if result["error"]["code"] == "OOM" and self._rt is not None:
                         exc.__traceback__ = None
+                        cause.__traceback__ = None
                         try:
                             self._rt.hard_reset()
                         except Exception:
@@ -445,7 +582,9 @@ class Flash:
                         finally:
                             self._cache.clear()
                             self._tick.clear()
-                    return self._record_rsi_run(result, tone, spec, req)
+                    return result
+                finally:
+                    attempt.snapshot("end")
 
             result = {
                 "ok": True,
@@ -455,35 +594,27 @@ class Flash:
                 "elapsed_s": round(time.time() - started, 2),
             }
             result.update(meta)
+            if "request_id" in req:
+                result["request_id"] = req["request_id"]
             if verbose:
                 result["log"] = (buf_err.getvalue() + buf_out.getvalue())[-4000:]
-            return self._record_rsi_run(result, tone, spec, req)
+            return result
 
-        except ParamError as exc:
+        except artifact.DeliveryError as exc:
             result = self._fail(tone, seed_value, exc, None, started, exc.code)
-            return self._record_rsi_run(result, tone, spec, req)
+            result["validation"] = exc.validation
+            if exc.recoverable_paths:
+                result["recoverable_paths"] = exc.recoverable_paths
+            return result
+        except ParamError as exc:
+            return self._fail(tone, seed_value, exc, None, started, exc.code)
         except Exception as exc:
-            result = self._fail(tone, seed_value, exc, None, started, "ENGINE_ERROR")
-            return self._record_rsi_run(result, tone, spec, req)
+            return self._fail(tone, seed_value, exc, None, started, "ENGINE_ERROR")
 
     # ------------------------------------------------------------- 内部
-    def _preflight(self, tone=None, prompt=None, image_in=None, audio_in=None, resolution=None,
-                   duration=None, seed=None, output=None, verbose=None, **advanced):
-        """只做参数与模型文件检查，不加载推理库；通过返回 None，否则返回 error 字典。"""
-        if tone is None:
-            return {"code": "MISSING_INPUT", "message": "请求缺少 tone（可用：{}）".format(", ".join(TONES))}
-        try:
-            spec = self._spec(tone)
-            self._resolve(spec, prompt, image_in, audio_in, resolution, duration, seed, output, dict(advanced))
-            for key, name in (spec.get("models") or {}).items():
-                self.model_path(name, _MODEL_KINDS[key])
-        except ParamError as exc:
-            return {"code": exc.code, "message": exc.message}
-        except (TypeError, ValueError, OSError) as exc:
-            return {"code": "BAD_REQUEST", "message": str(exc)}
-        return None
-
     def _spec(self, tone: str) -> dict:
+        if tone is None:
+            raise ParamError("MISSING_INPUT", "请求缺少 tone")
         module = TONES.get(str(tone))
         if module is None:
             raise ParamError(
@@ -516,147 +647,83 @@ class Flash:
             "elapsed_s": round(time.time() - started, 2),
         }
 
-    def _resolve(self, spec, prompt, image_in, audio_in, resolution, duration, seed, output, advanced) -> dict:
+    def _resolve(self, spec, prompt, image_in, audio_in, resolution, duration, seed, output, advanced,
+                 *, planned_images=None) -> dict:
         inputs = spec.get("inputs", {})
         required = list(inputs.get("required", []))
         accepted = required + list(inputs.get("optional", []))
         controls = spec.get("controls", {})
 
-        # prompt
-        if "prompt" in accepted:
-            if prompt is None or not str(prompt).strip():
-                raise ParamError("MISSING_INPUT", "{} 需要非空 prompt".format(spec["name"]))
-            prompt = str(prompt).strip()
+        if prompt is None and "prompt" in required:
+            raise ParamError("MISSING_INPUT", f"{spec['name']} requires prompt")
+        if prompt is not None:
+            if "prompt" not in accepted:
+                raise ParamError("UNSUPPORTED_INPUT", f"{spec['name']} does not accept prompt")
+            prompt = contracts.scalar_value("prompt", prompt, controls["prompt"], "MISSING_INPUT").strip()
+        if audio_in is not None:
+            raise ParamError("UNSUPPORTED_INPUT", f"{spec['name']} does not accept audio_in")
 
-        # image_in
-        images: list[str] = []
+        images, input_artifacts = [], []
+        image_size = None
+        planned_images = planned_images or {}
         if image_in is not None:
             if "image_in" not in accepted:
-                raise ParamError(
-                    "UNSUPPORTED_INPUT",
-                    "{} 不接受 image_in；需要参考图的音色是 t2 / t4".format(spec["name"]),
-                )
-            images = _normalize_images(image_in)
+                raise ParamError("UNSUPPORTED_INPUT", f"{spec['name']} does not accept image_in")
+            images, input_artifacts = _normalize_images(image_in, inputs["fields"]["image_in"], planned_images)
+            for path in images:
+                try:
+                    size = planned_images.get(Path(path).resolve()) or media.image_size(path)
+                except (OSError, ValueError, SyntaxError) as exc:
+                    raise ParamError("BAD_INPUT", f"Unreadable image {path}: {exc}") from exc
+                if image_size is None:
+                    image_size = size
         elif "image_in" in required:
-            raise ParamError("MISSING_INPUT", "{} 需要 image_in（参考图/待编辑图）".format(spec["name"]))
+            raise ParamError("MISSING_INPUT", f"{spec['name']} requires image_in")
 
-        # audio_in：v0.1 一律不实现，避免虚假能力
-        if audio_in is not None:
-            raise ParamError(
-                "UNSUPPORTED_INPUT",
-                "v0.1 的四个 Tone 都不接受 audio_in；H3 的同期声音由模型自身生成，"
-                "这里不提供音频输入接口",
-            )
-
-        # output
-        if output is None or not str(output).strip():
-            raise ParamError("MISSING_OUTPUT", "output 必须是完整输出路径，例如 D:/MV/shot01.mp4")
-        out_path = Path(str(output)).expanduser()
+        if not isinstance(output, (str, Path)) or not str(output).strip():
+            raise ParamError("MISSING_OUTPUT", "output must be an absolute file path")
+        out_path = Path(output).expanduser()
         if not out_path.is_absolute():
-            raise ParamError("MISSING_OUTPUT", "output 必须是绝对路径，收到 {}".format(out_path))
-        ext = out_path.suffix.lower()
-        if spec["output"] == "video" and ext not in media.VIDEO_EXT:
-            raise ParamError(
-                "BAD_OUTPUT", "{} 产出视频，扩展名需为 {}，收到 {!r}".format(
-                    spec["name"], "/".join(sorted(media.VIDEO_EXT)), ext
-                ),
-            )
-        if spec["output"] == "image" and ext not in media.IMAGE_EXT:
-            raise ParamError(
-                "BAD_OUTPUT", "{} 产出图片，扩展名需为 {}，收到 {!r}".format(
-                    spec["name"], "/".join(sorted(media.IMAGE_EXT)), ext
-                ),
-            )
+            raise ParamError("MISSING_OUTPUT", f"output must be absolute: {out_path}")
+        if "\0" in str(out_path):
+            raise ParamError("BAD_OUTPUT", "Output path contains a NUL character")
+        if os.name == "nt":
+            for part in out_path.parts[1:]:
+                if hasattr(os.path, "isreserved"):
+                    reserved = os.path.isreserved(part)
+                else:  # Windows Python 3.10–3.12
+                    reserved = (Path(part).is_reserved() or part.endswith((" ", ".")) or
+                                any(ord(c) < 32 or c in '<>:"|?*' for c in part))
+                if reserved and part != "..":
+                    raise ParamError("BAD_OUTPUT", f"Reserved Windows path component: {part!r}")
+        formats = spec["outputs"]["formats"]
+        if out_path.suffix.lower() not in formats or out_path.is_dir():
+            raise ParamError("BAD_OUTPUT", f"Expected an output file with extension in {formats}: {out_path}")
+        parent = next((p for p in out_path.parents if p.exists()), None)
+        if parent is None or not parent.is_dir() or not os.access(parent, os.W_OK):
+            raise ParamError("BAD_OUTPUT", f"Output parent cannot be created or written: {out_path.parent}")
 
-        # duration
-        frames = None
-        duration_value = None
-        if duration is not None and "duration" not in controls:
-            raise ParamError(
-                "UNSUPPORTED_CONTROL",
-                "{} 是图像 Tone，不使用 duration".format(spec["name"]),
-            )
-        if "duration" in controls:
-            decl = controls["duration"]
-            duration_value = decl["default"] if duration is None else float(duration)
-            if not (decl["min"] <= duration_value <= decl["max"]):
-                raise ParamError(
-                    "BAD_DURATION",
-                    "duration 需在 {}–{} 秒之间，收到 {}".format(decl["min"], decl["max"], duration_value),
-                )
-            frames = h3.align_frame_count(round(duration_value * h3.FPS))
-
-        # seed
+        advanced = dict(advanced)
+        timing = contracts.resolve_time(spec, duration, advanced.pop("fps", None))
+        delivery = contracts.resolve_delivery(spec, advanced)
+        for destination in artifact.output_paths(out_path, spec["output"]).values():
+            if destination.is_dir() or delivery["overwrite"] and destination.is_symlink():
+                raise ParamError("BAD_OUTPUT", f"Output destination cannot be replaced: {destination}")
+            if not delivery["overwrite"] and (destination.exists() or destination.is_symlink()):
+                raise ParamError("OUTPUT_EXISTS", f"Output already exists: {destination}; set overwrite=true to replace it")
         if seed is None:
             seed_value = random.SystemRandom().randrange(0, 2 ** 31)
         else:
-            if isinstance(seed, bool) or not isinstance(seed, int):
-                raise ParamError("BAD_SEED", "seed 必须是整数或 None，收到 {!r}".format(seed))
-            seed_value = seed % (2 ** 63)
+            seed_value = contracts.scalar_value("seed", seed, controls.get("seed", {"type": "integer"}), "BAD_SEED") % (2 ** 63)
 
-        # resolution
-        decl = controls.get("resolution", {})
-        res_value = decl.get("default") if resolution is None else resolution
-        image_size = media.image_size(images[0]) if images and str(res_value).lower() == "match" else None
-        try:
-            width, height = h3.resolve_canvas(spec["output"], res_value, image_size)
-        except ValueError as exc:
-            raise ParamError("BAD_RESOLUTION", str(exc))
-
-        provided = set(advanced)
-        params = {}
-        for key, decl in (spec.get("advanced") or {}).items():
-            value = advanced.pop(key, decl.get("default"))
-            if "choices" in decl and value is not None and value not in decl["choices"]:
-                raise ParamError(
-                    "BAD_PARAM",
-                    "{} 的 {} 只支持 {}，收到 {!r}".format(
-                        spec["name"], key, "/".join(map(str, decl["choices"])), value
-                    ),
-                )
-            if "min" in decl:
-                try:
-                    value = float(value)
-                except (TypeError, ValueError):
-                    raise ParamError("BAD_PARAM", "{} 必须是数字".format(key))
-                if not (decl["min"] <= value <= decl["max"]):
-                    raise ParamError(
-                        "BAD_PARAM",
-                        "{} 需在 {}–{} 之间，收到 {}".format(key, decl["min"], decl["max"], value),
-                    )
-                if isinstance(decl.get("default"), int):
-                    value = int(round(value))
-            params[key] = value
-        if spec["output"] == "video":
-            # Omitted knobs retain their v0.1 defaults for custom sampling recipes.
-            if "scheduler" not in provided and provided & {"steps", "sampler", "cfg"}:
-                uses_pika = "sampler" in provided and params["sampler"] == "lcm" and params["steps"] == 6
-                if not uses_pika:
-                    params["scheduler"] = "simple"
-            if params["scheduler"] != "pika":
-                if "steps" not in provided:
-                    params["steps"] = 20
-                if "sampler" not in provided:
-                    params["sampler"] = "res_multistep"
-            elif params["sampler"] != "lcm" or params["steps"] != len(h3.PIKA_SIGMAS) - 1:
-                raise ParamError("BAD_PARAM", "pika 调度需要 lcm 和 6 步；自定义采样请使用其他调度器")
-        if advanced:
-            raise ParamError(
-                "UNSUPPORTED_CONTROL",
-                "{} 不认识这些参数：{}（可用：{}）".format(
-                    spec["name"], ", ".join(sorted(advanced)), ", ".join(sorted(spec.get("advanced") or {})) or "无"
-                ),
-            )
-
+        decl = controls["resolution"]
+        res_value = decl["default"] if resolution is None else resolution
+        res_value = contracts.scalar_value("resolution", res_value, decl, "BAD_RESOLUTION")
+        width, height = contracts.resolve_canvas(spec, res_value, image_size)
+        params = contracts.resolve_advanced(spec, advanced)
         return {
-            "prompt": prompt,
-            "images": images,
-            "output": str(out_path),
-            "width": width,
-            "height": height,
-            "frames": frames,
-            "duration": duration_value,
-            "seed": seed_value,
-            "resolution": res_value,
-            "advanced": params,
+            "prompt": prompt, "images": images, "input_artifacts": input_artifacts, "output": str(out_path),
+            "width": width, "height": height, "frames": timing.get("aligned_frame_count"),
+            "duration": timing.get("requested_duration_s"), "seed": seed_value,
+            "resolution": res_value, "advanced": params, **timing, **delivery,
         }

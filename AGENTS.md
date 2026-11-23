@@ -1,11 +1,13 @@
-# ComfyFlash
+# ComfyFlash Agent 登记
 
-如果用户发来这个目录以接入 ComfyFlash，直接登记。路径交接只登记工具。用户提出生成或编辑素材的需求后，再执行相应功能。
+用户把本目录交给 Agent 时，先登记工具。用户随后提出生成或编辑任务时，再按任务调用。
 
-1. 找到本目录的绝对路径。用可用的 Python 3.10+ 运行 `python -B "<ComfyFlash>/engine/agent.py" register`。
-2. 有明确的用户项目根目录时，追加 `--project "<项目根目录>"`。Codex 使用默认设置，Claude Code 追加 `--agent claude-code`。独立对话省略 `--project`。
-3. 回报 `hardware.summary`、系统内存、显卡名称和每卡显存。如果注册失败，说明缺少的权重、Python 导入或 CUDA 问题。有多套同样合适的安装时先核对路径。需要下载或安装时，先说明来源、模型总大小及目标位置，并报告 `download_space` 显示的空间缺口，询问用户是否补齐。用户同意后，运行 `download_argv` 并追加 `--yes`，或按 `install_guide` 安装符合报告要求的 ComfyUI/Python 环境。修复现有依赖时以报告中的解释器为目标。完成后用同一范围重新注册。
-4. `ok` 为 true 时，回复 `summary`、`default_engine`、`local_render` 和硬件检查结果。保存 `play_argv` 并读取 `guide`。除非用户指定其他工具，当前对话及已注册项目的相关生成任务默认调用 ComfyFlash。单个素材传一个 `--request`，多个互不依赖的素材在同一次命令中重复传入 `--request`，让引擎按可用 GPU 并发。
-5. Agent 在工作中若发现 ComfyFlash 自身的缺陷、接口摩擦、硬件调度问题、可复用的性能/质量优化机会，应留下 RSI 点评，而不是只在当前对话里提及。优先关联生成结果返回的 `run_id`：`python -B "<ComfyFlash>/engine/agent.py" rsi note --title "简短标题" --observation "观察到的事实和复现条件" --category optimization --severity medium --author codex --run-id "<run_id>" --tone t2 --suggestion "建议方向"`。记录前可用 `rsi list --status open --search "关键词"` 检查重复。点评是经验线索，不代表自动修改代码或自动采纳。
+1. 用 Python 3.10+ 运行 `python -B "<ComfyFlash>/engine/agent.py" register`。有明确项目路径时追加 `--project "<项目路径>"`。Claude Code 项目追加 `--agent claude-code`。
+2. 回报 `summary`、`default_engine`、`local_render` 和硬件检查结果。如果报告缺少依赖或模型，先用报告中的来源、目标路径和大小告知用户，得到确认后再补齐。保留报告返回的 `tone_list_argv`、`tone_info_argv` 和 `play_argv`。
+3. 阅读报告返回的 `guide`。首次调用先发现 Tone，再按当前 Tone 的 `prompt_format` 和本地指南整理请求。用户明确指定原文时按其要求处理。适用任务默认使用登记的 ComfyFlash。
+4. 整批可用 `play --dry-run` 预检。把产生参考素材的请求排在使用它的请求前。需要替换文件时由请求明确启用 `overwrite`。从 `artifact.inspection` 找到成品的观察材料。
+5. 用 RSI 的 `run_id` 关联可复现的问题或优化机会。制作任务可用 XCard 的 `list` 和 `show` 查找本机另行安装的工具，再阅读工具自身说明。
 
-维护项目时，用 `python -B -m unittest discover -s engine/tests` 检查登记流程。提交到 GitHub 的内容使用可移植示例配置。
+项目代码在同一个主 Git 工作区维护，发布版本写在项目说明。开发检查使用 `python -B -m unittest discover -s engine/tests`。
+
+[Agent Skill](engine/skills/comfyflash/SKILL.md) · [调用接口](docs/API.md) · [RSI 点评](docs/RSI.md) · [XCard](xcard/README.md)

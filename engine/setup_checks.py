@@ -115,15 +115,16 @@ with contextlib.redirect_stdout(sys.stderr):
             try:
                 with torch.cuda.device(index):
                     free, total = torch.cuda.mem_get_info()
+                    capability = torch.cuda.get_device_capability(index)
                     gpu.update(name=torch.cuda.get_device_name(), total_mib=total // 2**20,
-                               free_mib=free // 2**20)
+                               free_mib=free // 2**20, compute_capability=capability)
                     uuid = getattr(torch.cuda.get_device_properties(index), "uuid", None)
                     if uuid is not None:
                         gpu["uuid"] = str(uuid)
                     value = torch.ones(2, device="cuda", dtype=torch.bfloat16)
                     (value + value).sum().item()
                     gpu["ready"] = True
-                    if root and torch.cuda.get_device_capability(index)[0] >= 8:
+                    if root and capability[0] >= 8:
                         gpu["video_acceleration"] = probe_video_acceleration(torch, gpu)
             except Exception as exc:
                 gpu["error"] = str(exc)
@@ -208,7 +209,7 @@ def nvidia_inventory():
         return []
 
 
-def hardware_report(runtime, preferred=None, *, inventory=False):
+def hardware_report(runtime, preferred=None, *, inventory=False, allow_parallel=True):
     cuda_gpus = runtime.get("gpus", [])
     detected = nvidia_inventory() if inventory or cuda_gpus else []
     physical_free = {
@@ -235,6 +236,31 @@ def hardware_report(runtime, preferred=None, *, inventory=False):
                       if gpu["index"] in batch_devices and gpu["free_mib"] >= BATCH_FREE_VRAM_MIB]
     if (free_ram or 0) < BATCH_FREE_RAM_MIB:
         active_devices = []
+
+    batch_decisions = []
+    for gpu in gpus:
+        reasons = []
+        if not gpu.get("ready"):
+            reasons.append("CUDA_NOT_READY")
+        if gpu.get("total_mib", 0) < VERIFIED_VRAM_MIB:
+            reasons.append(f"TOTAL_VRAM_BELOW_VERIFIED_{VERIFIED_VRAM_MIB}_MIB")
+        if len(qualified) < 2:
+            reasons.append("FEWER_THAN_TWO_VERIFIED_GPUS")
+        if (ram or 0) < RECOMMENDED_RAM_MIB:
+            reasons.append(f"SYSTEM_RAM_BELOW_RECOMMENDED_{RECOMMENDED_RAM_MIB}_MIB")
+        if gpu.get("free_mib", 0) < BATCH_FREE_VRAM_MIB:
+            reasons.append(f"FREE_VRAM_BELOW_BATCH_THRESHOLD_{BATCH_FREE_VRAM_MIB}_MIB")
+        if (free_ram or 0) < BATCH_FREE_RAM_MIB:
+            reasons.append(f"FREE_RAM_BELOW_BATCH_THRESHOLD_{BATCH_FREE_RAM_MIB}_MIB")
+        batch_decisions.append({
+            "index": gpu.get("index"),
+            "name": gpu.get("name"),
+            "uuid": gpu.get("uuid"),
+            "total_mib": gpu.get("total_mib"),
+            "free_mib": gpu.get("free_mib"),
+            "eligible": gpu.get("index") in active_devices,
+            "reasons": reasons,
+        })
     meets_baseline = bool(qualified and (ram or 0) >= RECOMMENDED_RAM_MIB)
     if meets_baseline:
         status = "达到 ComfyFlash 已验证的显存级别和建议内存。"
@@ -245,13 +271,16 @@ def hardware_report(runtime, preferred=None, *, inventory=False):
     count = max(len(gpus), len(detected))
     if count > 1:
         status += f"检测到 {count} 块 GPU，当前 CUDA 可用 {len(usable)} 块。"
-        if batch_devices:
+        if batch_devices and allow_parallel:
             status += "生成多个独立素材时会按当时的空闲资源启用多卡并发，单个素材使用一块卡。"
+        elif batch_devices:
+            status += "可以启用自动选卡，在资源允许时用多卡并发生成独立素材。"
         else:
             status += "当前以单卡运行条件评估。"
     return {"gpus": gpus, "detected_gpu_count": count, "ram_mib": ram,
             "free_ram_mib": free_ram, "device": device,
             "batch_devices": batch_devices, "active_devices": active_devices,
+            "batch_decisions": batch_decisions,
             "meets_baseline": meets_baseline, "summary": status}
 
 

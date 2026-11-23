@@ -47,8 +47,20 @@ def _pin_device(device: str) -> None:
     index = device.split(":", 1)[1].strip()
     if not index.isdigit():
         raise ValueError("device 格式应为 cuda:0 / cuda:1，收到：{!r}".format(device))
-    # 用户自己设过就不覆盖
-    os.environ.setdefault("CUDA_VISIBLE_DEVICES", index)
+    mask = os.getenv("CUDA_VISIBLE_DEVICES")
+    if mask is None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = index
+    elif "," in mask:
+        tokens = [item.strip() for item in mask.split(",")]
+        ordinal = int(index)
+        if ordinal >= len(tokens) or not tokens[ordinal]:
+            raise ValueError(f"{device} 不在 CUDA_VISIBLE_DEVICES 允许的范围内")
+        torch = sys.modules.get("torch")
+        if torch is not None and torch.cuda.is_initialized():
+            if torch.cuda.current_device() != ordinal:
+                raise ValueError(f"CUDA 进程已使用其他设备。请在独立进程使用 {device}。")
+        else:
+            os.environ["CUDA_VISIBLE_DEVICES"] = tokens[ordinal]
 
 
 class Runtime:
@@ -200,6 +212,16 @@ class Runtime:
             "attention_default": getattr(attention, "__name__", None),
             "fp16_accumulation": bool(getattr(matmul, "allow_fp16_accumulation", False)),
         }
+
+    def versions(self):
+        try:
+            comfy = self._mod("comfyui_version").__version__
+        except (ImportError, AttributeError):
+            comfy = None
+        torch = self.torch
+        return {"comfyui": comfy, "torch": str(torch.__version__), "cuda": torch.version.cuda,
+                "device": self.device, "cuda_visible_devices": os.getenv("CUDA_VISIBLE_DEVICES"),
+                "dynamic_vram": self.dynamic_vram}
 
     @property
     def torch(self):

@@ -3,19 +3,21 @@
 /ComfyFlash_H3_v0.1_Agent_Development_Spec.md
 /.agents/skills/comfyflash/
 /.claude/skills/comfyflash/
+/config.json
 /models/*
 !/models/config.example.json
+/outputs/
 __pycache__/
 *.py[cod]
 *.safetensors
 *.ckpt
 *.gguf
 
-# Local RSI history (keep RSI source and docs versioned)
-/RSI/data/*.sqlite3
-/RSI/data/*.sqlite3-wal
-/RSI/data/*.sqlite3-shm
-/RSI/data/*.db
-/RSI/data/*.db-wal
-/RSI/data/*.db-shm
-/RSI/data/*.sqlite3-journal
+# Local RSI history, telemetry and SQLite recovery files
+/RSI/data/
+*.sqlite3
+*.sqlite3-*
+*.sqlite3.*
+
+# Independently installed local XCards
+/xcard/*/
