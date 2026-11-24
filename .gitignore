@@ -18,6 +18,8 @@ __pycache__/
 *.sqlite3
 *.sqlite3-*
 *.sqlite3.*
+/engine/skills/h3vmaster.sqlite
+/engine/skills/h3vmaster.sqlite-*
 
 # Independently installed local XCards
 /xcard/*/

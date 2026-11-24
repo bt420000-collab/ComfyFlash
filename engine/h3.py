@@ -268,6 +268,13 @@ def cond_ref_av(rt, clip, vae, prompt: str, image, width: int, height: int, leng
     return cond, latent, frame_count
 
 
+def finish_conditioned_video(run, vae_video, cond, latent):
+    samples = run.sample(run.with_lora(run.unet()), cond, latent)
+    audio = run.decode_audio(run.vae("vae_audio"), samples)
+    frames = run.decode_frames(vae_video, samples)
+    return run.save_video(frames, audio)
+
+
 def cond_image(rt, clip, vae, prompt: str, width: int, height: int, images=None):
     """H3-Image：文生图，或带 <Picture n> 参考图的编辑。
 

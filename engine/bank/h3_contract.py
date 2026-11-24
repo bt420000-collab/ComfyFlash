@@ -1,6 +1,29 @@
 """Shared capability declarations for the H3 recipes in this Bank."""
 
+from copy import deepcopy
+
 from .. import h3, media
+
+
+H3_PROMPT_GUIDE = "engine/skills/comfyflash/SKILL.md"
+
+
+def derived_video_tone(base, *, tone_id, name, purpose, capability, image_role,
+                       prompt_format, image_control, notes, video_control=None):
+    """Reuse an H3 video recipe's model files and sampling controls."""
+    spec = deepcopy(base)
+    spec.update(id=tone_id, name=name, purpose=purpose, notes=notes, prompt_format=prompt_format,
+                inputs={"required": ["prompt", "image_in"], "optional": []})
+    spec["controls"]["prompt"] = {"note": prompt_format["instruction"]}
+    spec["controls"]["image_in"] = image_control
+    resolution = spec["controls"]["resolution"]
+    resolution["default"] = "768x448"
+    if "768x448" not in resolution["presets"]:
+        resolution["presets"].insert(0, "768x448")
+    if video_control:
+        spec["inputs"]["optional"].append("video_in")
+        spec["controls"]["video_in"] = video_control
+    return h3_tone(spec, capability=capability, image_role=image_role)
 
 
 def h3_tone(spec, *, capability, image_role=None):
@@ -9,11 +32,17 @@ def h3_tone(spec, *, capability, image_role=None):
     controls = spec["controls"]
     controls["prompt"].update(type="string", pattern=r"\S")
     if image_role:
+        image = controls["image_in"]
         fields["image_in"] = {
             "type": "path_artifact_or_list", "role": image_role, "media_type": "image",
-            "required": True, "min_items": 1, "max_items": 1,
+            "required": True, "min_items": image["min_items"], "max_items": image["max_items"],
         }
-        controls["image_in"]["type"] = "path_artifact_or_list"
+        image["type"] = "path_artifact_or_list"
+    if "video_in" in controls:
+        controls["video_in"]["type"] = "string"
+        fields["video_in"] = {
+            "type": "path", "role": "reference_video", "media_type": "video", "required": False,
+        }
     spec["inputs"]["fields"] = fields
     controls["seed"]["type"] = "integer"
     canvas = controls["resolution"]
@@ -31,6 +60,7 @@ def h3_tone(spec, *, capability, image_role=None):
         if "min" in decl:
             decl["coerce_numeric"] = True  # v0.1 accepted numeric text and rounded video steps.
     defaults = {key: decl["default"] for key, decl in params.items()}
+    spec["prompt_format"]["guide"] = H3_PROMPT_GUIDE
     spec.update(
         schema_version="0.2", version="0.2", tags=["h3", spec["output"], capability],
         capabilities=[capability] + (["joint_audio"] if video else []),
@@ -38,7 +68,7 @@ def h3_tone(spec, *, capability, image_role=None):
                  "audio_required": video},
         hardware_requirements={"device": "cuda", "tested_vram_gib": 16, "tested_ram_gib": 48},
         latency_class="tens_of_seconds_to_minutes" if video else "seconds_to_tens_of_seconds",
-        prompt_guide_ref=spec["prompt_format"]["guide"],
+        prompt_guide_ref=H3_PROMPT_GUIDE,
     )
     if video:
         controls["duration"].update(type="number", coerce_numeric=True)

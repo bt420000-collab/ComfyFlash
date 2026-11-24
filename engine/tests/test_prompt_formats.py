@@ -6,6 +6,7 @@ from engine.core import Flash
 
 
 ROOT = Path(__file__).resolve().parents[2]
+SKILL_GUIDE = ROOT / "engine" / "skills" / "comfyflash" / "SKILL.md"
 
 
 class PromptFormatMetadataTests(unittest.TestCase):
@@ -15,6 +16,8 @@ class PromptFormatMetadataTests(unittest.TestCase):
             "t2": "MiniMax H3 Ref2VA",
             "t3": "MiniMax H3-Image T2I",
             "t4": "MiniMax H3-Image Edit",
+            "t5": "MiniMax H3 I2VA",
+            "t6": "MiniMax H3 Ref2VA",
         }
         self.assertEqual(set(TONES), set(expected))
         for tone_id, expected_name in expected.items():
@@ -24,13 +27,13 @@ class PromptFormatMetadataTests(unittest.TestCase):
                 self.assertTrue(metadata.get("required"))
                 self.assertEqual(metadata.get("name"), expected_name)
                 guide = ROOT / metadata["guide"]
+                self.assertEqual(guide, SKILL_GUIDE)
                 self.assertTrue(guide.is_file(), str(guide))
-                self.assertIn("Required", guide.read_text(encoding="utf-8"))
 
     def test_tone_list_exposes_prompt_format_to_agents(self):
         flash = object.__new__(Flash)
         items = flash.tone_list()
-        self.assertEqual({item["tone"] for item in items}, {"t1", "t2", "t3", "t4"})
+        self.assertEqual({item["tone"] for item in items}, {"t1", "t2", "t3", "t4", "t5", "t6"})
         for item in items:
             with self.subTest(tone=item["tone"]):
                 self.assertTrue(item["prompt_format"]["required"])

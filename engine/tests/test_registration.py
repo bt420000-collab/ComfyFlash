@@ -68,6 +68,7 @@ class RegistrationTests(unittest.TestCase):
         self.assertEqual(Path(first["guide"]), target)
         installed = target.read_text(encoding="utf-8")
         self.assertIn('"tone-list"', installed)
+        self.assertIn('"prompt-ref"', installed)
         self.assertIn('"tone-info"', installed)
         self.assertIn("prompt_guide_ref", installed)
         original = target.read_bytes()
@@ -88,6 +89,7 @@ class RegistrationTests(unittest.TestCase):
         self.assertEqual(Path(result["guide"]), agent.GUIDE)
         self.assertIn("tone-list", result["tone_list_argv"])
         self.assertIn("tone-info", result["tone_info_argv"])
+        self.assertIn("prompt-ref", result["prompt_ref_argv"])
 
     def test_discover_reports_guide_and_schema_without_loading_the_runtime(self):
         self.models_for(*TONES)

@@ -1,4 +1,4 @@
-# ComfyFlash v0.2.0 API 与媒体交付
+# ComfyFlash API 与媒体交付
 
 ## 能力发现
 
@@ -17,13 +17,28 @@ python -B engine/agent.py tone-info t2
 | `t2` Pika 参考生视频 | `prompt`、`image_in` | 带同期声的视频 | Ref2VA 六段，`subject_definitions` → `summary` → `retention_analysis` → `detailed_description` → `overall_soundscape` → `non_diegetic_music` |
 | `t3` H3 文生图 | `prompt` | 图片 | 完整英文画面描述，先写用途和布局，再写主体和视觉细节 |
 | `t4` H3 图片编辑 | `prompt`、`image_in` | 图片 | 单段英文描述，依次写 `<Picture 1>` 源图、目标画面和具体改动 |
+| `t5` Pika 首帧生视频 | `prompt`、`image_in` | 带同期声的视频 | I2VA 首帧对齐句与 T2VA 三段结构 |
+| `t6` Pika 多参考生视频 | `prompt`、`image_in` | 带同期声的视频 | Ref2VA 六段，图片按输入顺序编号，可选动作视频用 `<Video 1>` |
 
-首次使用一种模式前阅读 `prompt_guide_ref` 指定的指南。每次调用由 Agent 按 `prompt_format` 改写用户意图，保留对白、歌词和可见文字的原文。只有用户明确要求逐字传入时才直接使用原文。逐字传入 `t4` 时可设置 `"prompt_prefix": ""` 关闭自动添加的编辑前缀。 [H3 视频提示词指南](../engine/skills/comfyflash/references/h3-video.md) · [H3 图片提示词指南](../engine/skills/comfyflash/references/h3-image.md)
+首次使用一种模式前查看 `prompt_guide_ref` 中对应的图像或视频小节。只有用户明确要求逐字传入时才直接使用原文。逐字传入 `t4` 时可设置 `"prompt_prefix": ""` 关闭自动添加的编辑前缀。 [H3 提示词指南](../engine/skills/comfyflash/SKILL.md#prepare-the-prompt)
+
+## H3 视频提示词参考
+
+`prompt-ref` 从本机 `engine/skills/h3vmaster.sqlite` 只读提取 MiniMax 官方写作 Skill、模式指南和场景参考，支持 `t1`、`t2`、`t5` 和 `t6`。写新提示词前运行 `tone-info` 给出的 `prompt_ref_argv`，附上场景关键词。首次为该模式写提示词时加 `--full-guide`。
+
+将另行取得的兼容 SQLite 库放到上述路径，或用 `--db` 指向现有库。库需提供 `skills` 和 `text_files`，并保留 `h3-prompt-writing/SKILL.md`、`h3-prompt-writing/references/base-en.txt` 与 `h3-prompt-writing/references/ref-en.txt`。视频场景查询只使用 `medium = 'video'` 的已分类条目，也兼容早期纯视频参考库。
+
+```text
+python -B engine/agent.py prompt-ref t1 --full-guide
+python -B engine/agent.py prompt-ref t2 --query "product advertising"
+```
+
+`official_skill` 返回官方写作流程。`references` 中的 `mode` 返回官方模式指南，默认提供节选，`--full-guide` 返回全文。`--query` 可用空格分隔的场景关键词查找最多三个技能，并从首选技能取一段 `scene` 参考。也可把返回的 `entry_path` 传给 `--entry` 精确选择。截断的条目会标记 `truncated`。`--db` 可指定本机的另一份库。缺库时返回 `available: false`，可从 `prompt_guide_ref` 打开官方来源。场景参考用于借鉴镜头、动作和声景，写法以官方模式指南为准，请求参数以 Tone 契约为准。
 
 ## 请求参数
 
 - `tone`、`prompt` 和绝对输出路径 `output` 必填。图片可写 `.png`、`.jpg`、`.jpeg`、`.webp`、`.bmp`，视频可写 `.mp4`、`.mov`、`.mkv`。视频使用 H.264 与 AAC。
-- `t2` 和 `t4` 各接收一张可读取的图片。`image_in` 可以是绝对路径、图像 Artifact 或仅含一项的数组。四个 Tone 的 `audio_in` 只接受 `null` 或省略。视频同期声由模型生成。
+- `t2`、`t4` 和 `t5` 各接收一张图片，`t6` 接收 1–9 张有序图片。`image_in` 支持绝对路径、图像 Artifact 或符合数量要求的数组。`t6` 的可选 `video_in` 为单个本地视频绝对路径，按 24 fps 取样后至少需 5 帧。所有 Tone 的 `audio_in` 可省略或设为 `null`。视频同期声由模型生成。
 - `seed` 可传整数以复用种子，省略或传 `null` 时随机生成。以实际生成结果中的 `seed` 为准。
 - 视频 `resolution` 支持 `16:9`、`9:16`、`1:1`、`4:3`、`3:4`、`21:9`、`720p` 与自定义 `WxH`。`720p` 等于 `16:9` 的 `1344x768`。自定义画布宽高均以 32 像素为步长，短边至少 256 像素，面积至多为 768 × 1344 像素。
 - 图片 `resolution` 支持 `1k`、`2k`、`max`、`16:9`、`9:16`、`1:1`、`4:3`、`3:4` 与自定义 `WxH`。比例预设以 1024 × 1024 像素为目标面积，并将宽高对齐 32 像素。自定义画布的宽高均为 32 像素的正整数倍，面积至多为 3104 × 3104 像素。`t4` 的 `match` 保持输入比例，将短边限制在 1024–2048 像素并对齐 32 像素。需要指定像素尺寸时用 `WxH`。

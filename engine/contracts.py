@@ -107,6 +107,11 @@ def request_schema(spec):
             if field["min_items"] <= 1 <= field["max_items"]:
                 forms.insert(0, image)
             props[key] = {"oneOf": forms, "x-role": field["role"]}
+        elif key == "video_in":
+            field = inputs["fields"][key]
+            props[key] = {**scalar_schema(decl), "type": ["string", "null"], "minLength": 1,
+                          "x-path": "absolute-readable-video", "x-role": field["role"],
+                          "x-min-frames": decl["min_frames"]}
         else:
             prop = scalar_schema(decl)
             if key in ("resolution", "duration", "seed"):

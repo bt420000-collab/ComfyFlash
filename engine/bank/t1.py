@@ -24,7 +24,6 @@ TONE = h3_tone({
     "prompt_format": {
         "required": True,
         "name": 'MiniMax H3 T2VA',
-        "guide": 'engine/skills/comfyflash/references/h3-video.md',
         "instruction": '必须改写为官方 T2VA 三段结构：integrated_multimodal_description、overall_soundscape、non_diegetic_music；不可默认直接传入原始需求或普通翻译。',
     },
     "controls": {

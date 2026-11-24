@@ -24,7 +24,6 @@ TONE = h3_tone({
     "prompt_format": {
         "required": True,
         "name": 'MiniMax H3-Image T2I',
-        "guide": 'engine/skills/comfyflash/references/h3-image.md',
         "instruction": '必须按官方 H3-Image 文生图规则写完整英文画面描述：用途与任务、布局、主体关系、视觉细节、精确可见文字；不要使用关键词堆砌。',
     },
     "controls": {

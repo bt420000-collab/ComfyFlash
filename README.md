@@ -4,7 +4,7 @@
 
 ![ComfyFlash 概念图，展示 Agent 调用本地推理引擎生成图片和视频](docs/assets/comfyflash-home-hero.png)
 
-**v0.2.0** · 面向 AI Agent 的本地图片与视频推理工具。
+**v0.2.1** · 面向 AI Agent 的本地图片与视频推理工具。
 
 ComfyFlash 把经过验证的 ComfyUI 推理配方封装成可直接调用的 Tone。Agent 按任务选择能力和参数，图片与视频在本机生成，一次调用即可拿到成品和检查结果。生成无需启动 ComfyUI 服务或访问云端生成 API。Agent 的对话和工具调度仍按客户端计量。
 
@@ -30,6 +30,8 @@ python -B engine/agent.py register
 | `t2` | Pika 参考生视频 | 提示词、单张参考图 | 带模型同期声的视频 |
 | `t3` | H3 文生图 | 提示词 | 图片 |
 | `t4` | H3 图片编辑 | 提示词、待编辑图 | 图片 |
+| `t5` | Pika 首帧生视频 | 提示词、首帧图片 | 带模型同期声的视频 |
+| `t6` | Pika 多参考生视频 | 提示词、1–9 张参考图、可选动作视频 | 带模型同期声的视频 |
 
 ```text
 python -B engine/agent.py tone-list
@@ -38,7 +40,9 @@ python -B engine/agent.py preflight --request "D:/MyProject/shot.json"
 python -B engine/agent.py play --request "D:/MyProject/shot.json"
 ```
 
-首次使用一种 Tone 时，打开 `tone-info` 返回的提示词指南并按该模式制作请求。运行多个请求时，可用 `play --dry-run` 预检整批。视频成功后会交付联系表、尾帧、音轨报告和元数据。Python 应用也可直接调用 `Flash`。[CLI、Python 与请求示例](docs/API.md) · [H3 视频提示词](engine/skills/comfyflash/references/h3-video.md) · [H3 图像提示词](engine/skills/comfyflash/references/h3-image.md)
+首次使用一种 Tone 时，打开 `tone-info` 返回的提示词指南并按该模式制作请求。运行多个请求时，可用 `play --dry-run` 预检整批。视频成功后会交付联系表、尾帧、音轨报告和元数据。Python 应用也可直接调用 `Flash`。[CLI、Python 与请求示例](docs/API.md) · [H3 提示词指南](engine/skills/comfyflash/SKILL.md#prepare-the-prompt)
+
+配置本地 H3 导演数据集后，Agent 写视频提示词前会按场景查找官方写作指南和镜头参考。将另行取得的兼容 SQLite 库放在 `engine/skills/h3vmaster.sqlite`。源码下载包提供查库工具和官方指南链接。[数据集与调用说明](docs/API.md#h3-视频提示词参考)
 
 ## 运行记录与许可
 

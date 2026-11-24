@@ -1,5 +1,13 @@
 # 变更记录
 
+## v0.2.1
+
+配置 H3 导演数据集后，Agent 写视频提示词时可按场景查找运镜、动作衔接和节奏参考。
+
+- **官方提示词参考。** `prompt-ref` 根据 Tone 读取 MiniMax 官方写作 Skill 和模式指南，并返回一段匹配的场景参考。可选 SQLite 参考库由用户另行配置。
+- **视频模式。** 新增 `t5` 首帧生视频与 `t6` 多参考生视频。`t6` 支持有序参考图和一段可选动作视频。
+- **Agent 指南。** 图像和视频指引集中到同一份 Skill，登记与 Tone 发现使用同一个入口。[H3 提示词指南](engine/skills/comfyflash/SKILL.md#prepare-the-prompt)
+
 ## v0.2.0
 
 - **发现与预检。** CLI 支持 `tone-list`、`tone-info` 和 `preflight`。批量调用在派发 GPU 前统一校验，也可通过 `play --dry-run` 只做预检。

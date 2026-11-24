@@ -26,7 +26,6 @@ TONE = h3_tone({
     "prompt_format": {
         "required": True,
         "name": 'MiniMax H3 Ref2VA',
-        "guide": 'engine/skills/comfyflash/references/h3-video.md',
         "instruction": '必须改写为官方 Ref2VA 六段结构：subject_definitions、summary、retention_analysis、detailed_description、overall_soundscape、non_diegetic_music；统一引用标签。',
     },
     "controls": {

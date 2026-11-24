@@ -1,4 +1,4 @@
-# ComfyFlash v0.2.0 引擎开发
+# ComfyFlash 引擎开发
 
 调用示例、请求 Schema、媒体交付与批量结果见 [API 指南](../docs/API.md)。登记和环境配置见[快速开始](../README.md#快速开始)。
 
@@ -23,18 +23,18 @@
 
 注册入口使用 Python 3.10+。推理使用带 H3 支持的 ComfyUI 环境和它的 Python，注册报告会检查 PyTorch、Pillow、NumPy、PyAV、safetensors、comfy-kitchen、psutil 及 CUDA。动态显存依赖当前 PyTorch、NVIDIA 与 AIMDO 接口。基准使用 Windows、Python 3.13.14 和 PyTorch 2.13.0+cu130，详细版本与硬件见[测试报告](../docs/TEST_REPORT.md)。
 
-将本机路径写入 `models/config.json`，可参照[示例配置](../models/config.example.json)。`comfyui_root` 指向包含 `comfy/` 的目录，`comfyui_models_path` 可指定共享模型目录，`model_dirs` 可分别指定 `diffusion_models`、`text_encoders`、`vae` 和 `loras`。四个 Tone 共用或分别引用 9 个模型文件，完整集合约 81.1 GiB。
+将本机路径写入 `models/config.json`，可参照[示例配置](../models/config.example.json)。`comfyui_root` 指向包含 `comfy/` 的目录，`comfyui_models_path` 可指定共享模型目录，`model_dirs` 可分别指定 `diffusion_models`、`text_encoders`、`vae` 和 `loras`。六个 Tone 共用或分别引用 9 个模型文件，完整集合约 81.1 GiB。
 
 | 目录 | 权重文件 | Tone |
 | --- | --- | --- |
-| `diffusion_models` | `minimax_h3_fl2va_pruned_int8_convrot.safetensors` | `t1` |
-| `diffusion_models` | `minimax_h3_ref2va_pruned_int8_convrot.safetensors` | `t2` |
+| `diffusion_models` | `minimax_h3_fl2va_pruned_int8_convrot.safetensors` | `t1`、`t5` |
+| `diffusion_models` | `minimax_h3_ref2va_pruned_int8_convrot.safetensors` | `t2`、`t6` |
 | `diffusion_models` | `minimax_h3_image_pruned_int8_convrot.safetensors` | `t3`、`t4` |
-| `text_encoders` | `qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors` | `t1`–`t4` |
-| `vae` | `minimax_h3_video_vae_int8_convrot.safetensors`、`minimax_h3_audio_vae_fp32.safetensors` | `t1`、`t2` |
+| `text_encoders` | `qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors` | `t1`–`t6` |
+| `vae` | `minimax_h3_video_vae_int8_convrot.safetensors`、`minimax_h3_audio_vae_fp32.safetensors` | `t1`、`t2`、`t5`、`t6` |
 | `vae` | `minimax_h3_image_vae_fp16.safetensors` | `t3`、`t4` |
-| `loras` | `pika_h3_flex_fl2va_v1_bf16.safetensors` | `t1` |
-| `loras` | `pika_h3_flex_ref2va_v1_bf16.safetensors` | `t2` |
+| `loras` | `pika_h3_flex_fl2va_v1_bf16.safetensors` | `t1`、`t5` |
+| `loras` | `pika_h3_flex_ref2va_v1_bf16.safetensors` | `t2`、`t6` |
 
 `engine/bank/` 中的 Tone 声明是权重映射的来源。`tone-info` 返回每个模型的实际路径和文件状态，注册报告核查支持的模型文件，并提供补齐缺失权重所需的大小、空间和下载命令。权重与 LoRA 按各自许可单独取得，已有模型目录可供引擎只读使用。
 

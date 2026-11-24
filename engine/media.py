@@ -40,6 +40,50 @@ def image_size(path: str):
         return ImageOps.exif_transpose(img).size
 
 
+def load_reference_video(rt, path: str, *, fps: int, max_frames: int, max_pixels: int):
+    """Decode the first video stream to a capped, constant-rate RGB frame tensor."""
+    import av
+    import numpy as np
+
+    with av.open(path, mode="r") as container:
+        if not container.streams.video:
+            raise ValueError("Reference file has no video stream")
+        stream = container.streams.video[0]
+        interval = 1 / float(stream.average_rate or fps)
+        width, height = stream.width, stream.height
+        if min(width, height) < 1:
+            raise ValueError("Invalid reference video dimensions")
+        scale = min(1.0, math.sqrt(max_pixels / (width * height)))
+        width, height = max(1, round(width * scale)), max(1, round(height * scale))
+        frames = np.empty((max_frames, height, width, 3), dtype=np.uint8)
+        count = 0
+        previous = None
+        start = last_time = 0.0
+        frame_duration = interval
+        for frame in container.decode(stream):
+            timestamp = frame.time
+            if previous is None and timestamp is not None:
+                start = timestamp
+            time = (0.0 if previous is None else last_time + frame_duration) if timestamp is None else timestamp - start
+            if previous is not None:
+                # Hold the preceding source frame until this presentation timestamp.
+                end = min(max_frames, math.ceil(time * fps - 1e-8))
+                if end > count:
+                    frames[count:end] = previous
+                    count = end
+                if count == max_frames:
+                    break
+            previous = frame.reformat(width=width, height=height, format="rgb24").to_ndarray()
+            last_time = time
+            frame_duration = float(frame.duration * frame.time_base) if frame.duration and frame.time_base else interval
+        if previous is not None and count < max_frames:
+            end = min(max_frames, math.ceil((last_time + frame_duration) * fps - 1e-8))
+            if end > count:
+                frames[count:end] = previous
+                count = end
+    return rt.torch.from_numpy(frames[:count]).float().div_(255)
+
+
 def inspection_paths(path: str | Path) -> dict[str, str]:
     """Return video inspection filenames beside the video."""
     out = Path(path)

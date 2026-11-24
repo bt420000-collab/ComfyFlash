@@ -3,7 +3,7 @@
 主要入口为 ``tone_list()``、``tone_info()``、``preflight()`` 和 ``play()``。
 
 Engine 负责的"标准控制面板"：
-    prompt / image_in / audio_in / resolution / duration / seed / output
+    prompt / image_in / video_in / audio_in / resolution / duration / seed / output
 Tone 只负责它自己的配方（模型、LoRA、采样器、条件拼装）。
 
 零服务：本模块不监听端口、不起子进程、不连 HTTP/WebSocket，也不要求 ComfyUI 在运行。
@@ -106,6 +106,25 @@ def _normalize_images(value, field, planned_images):
     return paths, lineage
 
 
+def _normalize_video(value, minimum_frames, fps, planned_videos):
+    if not isinstance(value, (str, Path)) or not str(value).strip() or "\0" in str(value):
+        raise ParamError("BAD_INPUT", "video_in requires an absolute path to one local video file")
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        raise ParamError("BAD_INPUT", f"video_in requires an absolute path: {path}")
+    try:
+        if path.resolve() not in planned_videos:
+            if not path.is_file():
+                raise FileNotFoundError(f"No such file: {path}")
+            info = media.probe_video(path)
+            duration = info.get("duration_s")
+            if duration is not None and duration <= (minimum_frames - 1) / fps:
+                raise ValueError(f"Video must provide at least {minimum_frames} frames at {fps} fps")
+    except (OSError, ValueError, ImportError, RuntimeError) as exc:
+        raise ParamError("BAD_INPUT", f"Unreadable reference video {path}: {exc}") from exc
+    return str(path)
+
+
 @lru_cache(maxsize=64)
 def _weight_signature(path, size, modified_ns):
     """Sample model bytes without reading the full checkpoint on each cold run."""
@@ -134,6 +153,7 @@ class _Run:
         self.seed = req["seed"]
         self.output = req["output"]
         self.image_paths = req["images"]
+        self.video_path = req.get("video_path")
         self.params = req["advanced"]
         self.meta: dict = {}
         self.video = spec["output"] == "video"
@@ -266,6 +286,9 @@ class _Run:
         role = self.spec["inputs"].get("fields", {}).get("image_in", {}).get("role")
         sources = [{"role": role, "path": path, "metadata": meta}
                    for path, meta in zip(self.image_paths, self.req["input_artifacts"])]
+        if self.video_path:
+            role = self.spec["inputs"]["fields"]["video_in"]["role"]
+            sources.append({"role": role, "path": self.video_path, "metadata": None})
         runtime = self.rt.versions()
         if self.video:
             runtime.update(self.rt.video_acceleration(), decode_offloaded=getattr(self, "_offloaded", False))
@@ -460,26 +483,28 @@ class Flash:
         return {key: self.model_path(name, _MODEL_KINDS[key]) for key, name in spec.get("models", {}).items()}
 
     def validate_request(self, tone=None, prompt=None, image_in=None, audio_in=None, resolution=None,
-                         duration=None, seed=None, output=None, verbose=None, *, _planned_images=None, **advanced):
+                         duration=None, seed=None, output=None, verbose=None, *, video_in=None,
+                         _planned_images=None, _planned_videos=None, **advanced):
         """Validate without importing the runtime, including known earlier batch outputs."""
         if self._closed:
             raise ParamError("CLOSED", "Flash 已关闭，请重新 with Flash() 后再调用")
         spec = self._spec(tone)
         req = self._resolve(spec, prompt, image_in, audio_in, resolution, duration, seed, output, advanced,
-                            planned_images=_planned_images)
+                            planned_images=_planned_images, video_in=video_in, planned_videos=_planned_videos)
         paths = self._check_models(spec)
         summary = {key: req.get(key) for key in ("output", "overwrite", "resolution", "width", "height", "seed",
                                                  "requested_duration_s", "requested_frame_count", "aligned_frame_count")}
         return {"ok": True, "tone": tone, "model_paths": paths, **summary}
 
     def preflight(self, tone, prompt=None, image_in=None, audio_in=None, resolution=None,
-                  duration=None, seed=None, output=None, verbose=None, **advanced):
+                  duration=None, seed=None, output=None, verbose=None, *, video_in=None, **advanced):
         """Resolve a request and check local dependencies without starting inference."""
         started = time.time()
         seed_value = None
         try:
             spec = self._spec(tone)
-            req = self._resolve(spec, prompt, image_in, audio_in, resolution, duration, seed, output, advanced)
+            req = self._resolve(spec, prompt, image_in, audio_in, resolution, duration, seed, output, advanced,
+                                video_in=video_in)
             seed_value = req["seed"]
             self._check_models(spec)
             return {"ok": True, "tone": tone, "resolved": req}
@@ -497,11 +522,13 @@ class Flash:
         seed=None,
         output=None,
         verbose=None,
+        *,
+        video_in=None,
         **advanced,
     ):
         attempt = telemetry.Attempt(tone, advanced.get("request_id"))
         result = self._play(attempt, tone, prompt, image_in, audio_in, resolution, duration,
-                            seed, output, verbose, advanced)
+                            seed, output, verbose, advanced, video_in=video_in)
         result.setdefault("device", os.getenv("COMFYFLASH_DEVICE_LABEL") or self._cfg.get("device", "cuda:0"))
         try:
             record = result["telemetry"] = attempt.finish(result)
@@ -521,14 +548,15 @@ class Flash:
         return result
 
     def _play(self, attempt, tone, prompt, image_in, audio_in, resolution, duration, seed, output,
-              verbose, advanced):
+              verbose, advanced, *, video_in=None):
         started = time.time()
         seed_value = None
         verbose = self.verbose if verbose is None else bool(verbose)
         try:
             with attempt.measure("preflight"):
                 spec = self._spec(tone)
-                req = self._resolve(spec, prompt, image_in, audio_in, resolution, duration, seed, output, advanced)
+                req = self._resolve(spec, prompt, image_in, audio_in, resolution, duration, seed, output, advanced,
+                                    video_in=video_in)
                 seed_value = req["seed"]
                 attempt.configure(spec, req, self._cfg)
                 self._check_models(spec)
@@ -648,7 +676,7 @@ class Flash:
         }
 
     def _resolve(self, spec, prompt, image_in, audio_in, resolution, duration, seed, output, advanced,
-                 *, planned_images=None) -> dict:
+                 *, planned_images=None, video_in=None, planned_videos=None) -> dict:
         inputs = spec.get("inputs", {})
         required = list(inputs.get("required", []))
         accepted = required + list(inputs.get("optional", []))
@@ -679,6 +707,15 @@ class Flash:
                     image_size = size
         elif "image_in" in required:
             raise ParamError("MISSING_INPUT", f"{spec['name']} requires image_in")
+
+        video = {}
+        if video_in is not None:
+            if "video_in" not in accepted:
+                raise ParamError("UNSUPPORTED_INPUT", f"{spec['name']} does not accept video_in")
+            video["video_path"] = _normalize_video(video_in, controls["video_in"]["min_frames"],
+                                                   spec["temporal"]["fps"], planned_videos or ())
+        elif "video_in" in required:
+            raise ParamError("MISSING_INPUT", f"{spec['name']} requires video_in")
 
         if not isinstance(output, (str, Path)) or not str(output).strip():
             raise ParamError("MISSING_OUTPUT", "output must be an absolute file path")
@@ -725,5 +762,5 @@ class Flash:
             "prompt": prompt, "images": images, "input_artifacts": input_artifacts, "output": str(out_path),
             "width": width, "height": height, "frames": timing.get("aligned_frame_count"),
             "duration": timing.get("requested_duration_s"), "seed": seed_value,
-            "resolution": res_value, "advanced": params, **timing, **delivery,
+            "resolution": res_value, "advanced": params, **timing, **delivery, **video,
         }

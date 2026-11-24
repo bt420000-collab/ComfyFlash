@@ -24,7 +24,6 @@ TONE = h3_tone({
     "prompt_format": {
         "required": True,
         "name": 'MiniMax H3-Image Edit',
-        "guide": 'engine/skills/comfyflash/references/h3-image.md',
         "instruction": '必须按官方 H3-Image 编辑规则写成一个连续英文段落：源图/主体定义、目标画面与保留关系、具体修改；使用 <Picture 1>。',
     },
     "controls": {

@@ -4,7 +4,7 @@
 
 ![ComfyFlash artwork showing an AI agent using a local image and video inference engine](docs/assets/comfyflash-home-hero.png)
 
-**v0.2.0** · Local image and video inference for AI agents.
+**v0.2.1** · Local image and video inference for AI agents.
 
 ComfyFlash exposes verified ComfyUI inference recipes as directly callable Tones. Agents select the capability and parameters for each task. One call runs inference on your machine and returns the generated media and its inspection files. The CLI starts on demand and exits when the job finishes. Your agent client may still meter conversation and tool use.
 
@@ -30,6 +30,8 @@ Registration saves local settings to `models/config.json`. Use `--comfyui-root`,
 | `t2` | Pika reference to video | Prompt and one reference image | Video with generated audio |
 | `t3` | H3 text to image | Prompt | Image |
 | `t4` | H3 image editing | Prompt and one source image | Image |
+| `t5` | Pika first-frame video | Prompt and one first-frame image | Video with generated audio |
+| `t6` | Pika multi-reference video | Prompt, 1–9 reference images, and an optional motion reference video | Video with generated audio |
 
 ```text
 python -B engine/agent.py tone-list
@@ -38,7 +40,9 @@ python -B engine/agent.py preflight --request "D:/MyProject/shot.json"
 python -B engine/agent.py play --request "D:/MyProject/shot.json"
 ```
 
-Read the mode-specific prompt guide returned by `tone-info` before preparing a request. Use `play --dry-run` to validate a batch before dispatch. Successful video jobs return a contact sheet, last frame, audio report, and metadata. Python applications can call `Flash` directly. [CLI, Python API and request examples (Chinese)](docs/API.md) · [H3 video prompting](engine/skills/comfyflash/references/h3-video.md) · [H3 image prompting](engine/skills/comfyflash/references/h3-image.md)
+Read the selected Tone's section in the prompt guide returned by `tone-info`. Use `play --dry-run` to validate a batch before dispatch. Successful video jobs return a contact sheet, last frame, audio report, and metadata. Python applications can call `Flash` directly. [CLI, Python API and request examples (Chinese)](docs/API.md) · [H3 prompt guide](engine/skills/comfyflash/SKILL.md#prepare-the-prompt)
+
+With a compatible H3 directing library at `engine/skills/h3vmaster.sqlite`, agents can look up official writing guidance and scene references before drafting a video prompt. The source package includes the lookup tool and links to the official guides. Obtain the optional SQLite library separately. [Prompt lookup and library setup (Chinese)](docs/API.md#h3-视频提示词参考)
 
 ## Local history and license
 
