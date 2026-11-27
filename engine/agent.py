@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if not __package__:
     sys.path.insert(0, str(ROOT))
 
-from engine import Flash, __version__, media, prompt_reference, telemetry
+from engine import Flash, __version__, media, project_policy, prompt_reference, telemetry
 from engine.artifact import output_paths
 from engine.bank import TONES
 from engine.bank.h3_contract import H3_PROMPT_GUIDE
@@ -141,7 +141,8 @@ def check_models(settings):
     with Flash(config={**settings, "comfyui_root": settings.get("comfyui_root") or str(ROOT)}) as flash:
         for tone in flash.tone_list():
             absent = []
-            for model in flash.tone_info(tone["tone"])["models"]:
+            info = flash.tone_info(tone["tone"])
+            for model in info["models"]:
                 path = Path(model["path"]).expanduser().resolve()
                 if path not in checked:
                     entry = ARTIFACTS.get(model["file"])
@@ -155,7 +156,9 @@ def check_models(settings):
                 if checked[path]:
                     absent.append(str(path))
                     problems[path]["tones"].append(tone["tone"])
-            functions.append({**tone, "ready": not absent, "missing": absent})
+            plugins = [plugin for plugin in info.get("plugins", ()) if not plugin["exists"]]
+            functions.append({**tone, "ready": not absent and not plugins, "models_ready": not absent,
+                              "missing": absent, **({"missing_plugins": plugins} if plugins else {})})
     return functions, list(problems.values())
 
 
@@ -245,11 +248,37 @@ def exclude_skill_from_git(project, skill):
         raise ValueError(f"项目 Git 规则覆盖了本机忽略设置 | {skill}")
 
 
+def cinespindle_guide() -> Path:
+    card = ROOT / "xcard" / "CineSpindle"
+    guide = card / "H3_WORKFLOW.md"
+    if not guide.is_file() or not (card / "mindset" / "h3_preproduction.py").is_file():
+        raise FileNotFoundError(f"需要安装本机 CineSpindle XCard | {card}")
+    return guide
+
+
 def register(args):
     skill = project_skill(args)
+    production = {}
+    create_policy = False
+    if getattr(args, "video_workflow", None) and skill is None:
+        raise ValueError("--video-workflow cinespindle 需要指定 --project")
+    if skill:
+        project = args.project.expanduser().resolve()
+        try:
+            video_project = project_policy.production_project(project)
+        except ParamError as exc:
+            raise ValueError(exc.message) from exc
+        create_policy = video_project is None and getattr(args, "video_workflow", None) == "cinespindle"
+        if create_policy:
+            video_project = project
+        if video_project is not None:
+            production = {"video_workflow": "cinespindle",
+                          "production_policy": str(video_project / project_policy.POLICY_FILE),
+                          "video_workflow_guide": str(cinespindle_guide())}
     config, original, settings, comfy, comfy_issue = setup_settings(args)
     functions, problems = check_models(settings)
-    missing = [item for item in problems if "url" in item]
+    missing = [item for item in problems if "url" in item and not item.get("optional")]
+    optional_missing = [item for item in problems if item.get("optional")]
     missing_local = [item for item in problems if "url" not in item]
     runtime = choose_python(comfy, args.python or settings.get("python"))
     if not args.python and settings.get("python") and (
@@ -265,12 +294,27 @@ def register(args):
         hardware["summary"] += f" 当前配置固定使用 {pin}。"
     environment_ready = bool(comfy and runtime["ready"] and hardware["device"])
     for item in functions:
-        item["models_ready"] = item["ready"]
-        item["ready"] = item["models_ready"] and environment_ready
+        item.setdefault("models_ready", item["ready"])
+        item["ready"] = item["ready"] and environment_ready
     result = {"ok": False, "config": str(config), "functions": functions, "python": runtime,
               "hardware": hardware, "comfyui_root": str(comfy) if comfy else None}
     if missing_local:
         result["missing_local_models"] = missing_local
+    if missing or optional_missing:
+        fetch = [sys.executable, "-B", str(ENTRY), "download-models", "--config", str(config)]
+        if args.models_path or not settings.get("model_dirs"):
+            fetch.extend(("--models-path", settings["comfyui_models_path"]))
+        if comfy:
+            fetch.extend(("--comfyui-root", str(comfy)))
+    if optional_missing:
+        result.update(optional_missing_models=optional_missing,
+                      optional_download_bytes=sum(item["bytes"] for item in optional_missing))
+        if not isinstance(comfy_issue, LookupError):
+            optional_tones = sorted({tone for item in optional_missing for tone in item["tones"]})
+            result["optional_download_argv_by_tone"] = {
+                tone: [*fetch, "--tone", tone] for tone in optional_tones
+            }
+            result["optional_download_argv"] = result["optional_download_argv_by_tone"][optional_tones[0]]
     if missing or not environment_ready or not any(item["ready"] for item in functions):
         needs_cuda_build = hardware["detected_gpu_count"] > 0 and not runtime.get("cuda")
         result.update(
@@ -284,13 +328,7 @@ def register(args):
             install_guide=INSTALL_GUIDE, model_licenses=MODEL_LICENSES if missing else [],
         )
         if missing and not result["needs_path_selection"]:
-            result["download_argv"] = [
-                sys.executable, "-B", str(ENTRY), "download-models", "--config", str(config),
-            ]
-            if args.models_path or not settings.get("model_dirs"):
-                result["download_argv"].extend(("--models-path", settings["comfyui_models_path"]))
-            if comfy:
-                result["download_argv"].extend(("--comfyui-root", str(comfy)))
+            result["download_argv"] = fetch
         return result
 
     python = runtime["path"]
@@ -310,15 +348,26 @@ def register(args):
     }
     if skill:
         skill = project_skill(args)
-        exclude_skill_from_git(args.project.expanduser().resolve(), skill)
+        exclude_skill_from_git(project, skill)
         source = GUIDE.read_text(encoding="utf-8")
+        if production:
+            workflow = ("## 本项目视频制作入口\n\n"
+                        f"先读 [CineSpindle H3 工作流](<{Path(production['video_workflow_guide']).as_posix()}>"
+                        ")。逐镜记录视觉证据和路线理由，用 `h3-plan` 建立计划，按计划用 `h3-run` 执行。"
+                        "R2 先完成动作底片，用 `h3-review-motion` 记录实看，通过后再派发最终段。"
+                        "将计划、动作审查和实际交付记录存于影视项目。\n")
+            source = source.replace("# ComfyFlash\n", "# ComfyFlash\n\n" + workflow, 1)
         skill_text = source.rstrip() + "\n\n" + MANAGED + "\n\n"
         skill_text += "## 本项目调用配置\n\n"
-        skill_text += "把下列数组作为执行参数，在末尾追加 `--request` 和请求 JSON 的绝对路径。\n\n"
+        if production:
+            skill_text += "本项目的视频先按上文使用 `h3-run`。以下执行参数可用于图片任务和附有逐镜证据的视频 API 请求。\n\n"
+        skill_text += "在执行参数后追加 `--request` 和请求 JSON 的绝对路径。\n\n"
         skill_text += "```json\n" + json_text(argv) + "```\n"
         skill_text += "\n能力发现命令：\n\n```json\n" + json_text(discovery) + "```\n"
     if settings != original or not config.is_file():
         write_text(config, json_text(settings))
+    if create_policy:
+        write_text(video_project / project_policy.POLICY_FILE, json_text(project_policy.CINESPINDLE_POLICY))
     if skill:
         if not skill.exists() or skill.read_text(encoding="utf-8") != skill_text:
             write_text(skill, skill_text)
@@ -326,7 +375,7 @@ def register(args):
     names = "、".join(f"{item['tone']} {item['name']}" for item in functions if item["ready"])
     scope = "项目和当前对话" if skill else "当前对话"
     return {
-        **result, "ok": True,
+        **result, **production, "ok": True,
         "scope": "project" if skill else "conversation",
         "summary": f"已注册功能 — {names}",
         "default_engine": f"除非你指定其他工具，{scope}的生图、视频生成和图片编辑默认使用 ComfyFlash。",
@@ -345,9 +394,11 @@ def download_models(args):
     if isinstance(issue, LookupError) and not args.models_path:
         raise ValueError(str(issue))
     _, missing = check_models(settings)
+    tone = getattr(args, "tone", None)
     downloaded = []
     for entry in missing:
-        if "url" in entry and download_weight(entry):
+        selected = tone in entry["tones"] if tone else not entry.get("optional")
+        if selected and "url" in entry and download_weight(entry):
             downloaded.append(entry["path"])
     return {"ok": True, "downloaded": downloaded, "message": "运行 register 重新检查并注册。"}
 
@@ -391,7 +442,7 @@ def preflight_requests(config, requests):
     try:
         with Flash(config=config) as flash:
             planned_images = {}
-            planned_videos = set()
+            planned_videos = {}
             for position, request in enumerate(requests):
                 try:
                     if not isinstance(request, dict):
@@ -402,7 +453,11 @@ def preflight_requests(config, requests):
                     if output.suffix.lower() in media.IMAGE_EXT:
                         planned_images[output] = (validation["width"], validation["height"])
                     elif output.suffix.lower() in media.VIDEO_EXT:
-                        planned_videos.add(output)
+                        rate = validation["fps"]
+                        count = validation["aligned_frame_count"]
+                        planned_videos[output] = {"width": validation["width"], "height": validation["height"],
+                                                  "fps": rate, "frame_count": count,
+                                                  "duration_s": count / rate if count else None}
                         tail = output_paths(output, "video")["last_frame"]
                         planned_images[tail] = (validation["width"], validation["height"])
                     validations.append(validation)
@@ -868,6 +923,8 @@ def main():
     actions = cli.add_subparsers(dest="command", required=True)
     setup = actions.add_parser("register", help="检查环境并输出本次注册说明")
     setup.add_argument("--project", type=Path, help="在指定项目中注册技能。省略时用于当前对话")
+    setup.add_argument("--video-workflow", choices=("cinespindle",),
+                       help="在本项目启用 CineSpindle 逐镜视频审查")
     setup.add_argument("--agent", choices=tuple(SKILLS), default="codex")
     setup.add_argument("--python", help="推理 Python 的路径")
     setup.add_argument("--comfyui-root", help="设置本机 ComfyUI 目录")
@@ -878,6 +935,7 @@ def main():
     download.add_argument("--yes", action="store_true", help="表示用户已经确认下载")
     download.add_argument("--comfyui-root")
     download.add_argument("--models-path")
+    download.add_argument("--tone", choices=tuple(TONES), help="只补齐指定 Tone 的模型，包括可选超分权重")
     download.set_defaults(handler=download_models)
     tones = actions.add_parser("tone-list", help="读取当前能力目录")
     tones.set_defaults(handler=discover, tone=None)

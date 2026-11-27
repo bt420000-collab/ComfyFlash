@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from fractions import Fraction
 import math
 import os
 from pathlib import Path
@@ -82,6 +83,30 @@ def load_reference_video(rt, path: str, *, fps: int, max_frames: int, max_pixels
                 frames[count:end] = previous
                 count = end
     return rt.torch.from_numpy(frames[:count]).float().div_(255)
+
+
+def load_video_soundtrack(rt, path: str, duration: float):
+    """Read only the audio needed for the requested prefix of a reference video."""
+    import av
+    import numpy as np
+
+    with av.open(path, mode="r") as container:
+        stream = container.streams.audio[0]
+        rate = stream.codec_context.sample_rate
+        remaining = round(rate * duration)
+        frames = []
+        resampler = av.AudioResampler(format="fltp")
+        for frame in container.decode(stream):
+            for converted in resampler.resample(frame):
+                samples = converted.to_ndarray()[:, :remaining]
+                frames.append(samples)
+                remaining -= samples.shape[1]
+            if not remaining:
+                break
+    if not frames:
+        raise MediaWriteError(f"无法解码动作视频的音轨：{path}")
+    return {"waveform": rt.torch.from_numpy(np.concatenate(frames, axis=1))[None],
+            "sample_rate": rate}
 
 
 def inspection_paths(path: str | Path) -> dict[str, str]:
@@ -250,7 +275,7 @@ def _video_probe_details(stream, audio_stream_count):
     }
 
 
-def probe_video(path: str | Path, *, require_audio: bool = False) -> dict:
+def probe_video(path: str | Path, *, require_audio: bool = False, source_geometry: bool = False) -> dict:
     """Reopen a video and check its streams and first decodable frame."""
     import av
 
@@ -260,12 +285,20 @@ def probe_video(path: str | Path, *, require_audio: bool = False) -> dict:
         stream = container.streams.video[0]
         if stream.width <= 0 or stream.height <= 0:
             raise MediaWriteError(f"视频尺寸无效：{path}")
-        if next(container.decode(video=0), None) is None:
+        first = next(container.decode(video=0), None)
+        if first is None:
             raise MediaWriteError(f"视频无法解码出首帧：{path}")
         audio_stream_count = len(container.streams.audio)
         if require_audio and not audio_stream_count:
             raise MediaWriteError(f"生成请求包含音频，但封装结果没有音轨：{path}")
-        return {"status": "passed", **_video_probe_details(stream, audio_stream_count)}
+        details = _video_probe_details(stream, audio_stream_count)
+        if details["duration_s"] is None and container.duration:
+            details["duration_s"] = round(container.duration / av.time_base, 3)
+        if source_geometry:
+            details["frame_count"] = stream.frames or None
+            if round((getattr(first, "rotation", 0) or 0) / 90) % 2:
+                details["width"], details["height"] = details["height"], details["width"]
+        return {"status": "passed", **details}
 
 
 def audio_summary(audio, frame_count: int, fps: int) -> dict:
@@ -316,7 +349,7 @@ def _encode_video(frames, path: Path, fps: int = 24, audio=None, *, on_frame=Non
         raise ValueError(f"Invalid video dimensions/frame rate: {frames.shape}, {fps} fps")
     total, height, width, _ = map(int, frames.shape)
     with av.open(str(path), mode="w") as container:
-        vstream = container.add_stream("libx264", rate=fps)
+        vstream = container.add_stream("libx264", rate=Fraction(fps).limit_denominator(1_000_000))
         vstream.width = width
         vstream.height = height
         vstream.pix_fmt = "yuv420p"

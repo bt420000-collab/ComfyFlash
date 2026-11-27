@@ -32,8 +32,8 @@ def output_paths(path, media_type):
 
 
 @contextmanager
-def _publish_lock(directory):
-    """Serialize the short multi-file commit across writers, including overlapping bundles."""
+def directory_lock(directory):
+    """Serialize work that shares a directory across ComfyFlash processes."""
     if os.name == "nt":
         import ctypes
         from ctypes import wintypes
@@ -80,7 +80,7 @@ def _check_destinations(paths, overwrite, stage=None):
 
 
 def _publish(paths, stage, overwrite):
-    with _publish_lock(paths["media"].parent):
+    with directory_lock(paths["media"].parent):
         _check_destinations(paths, overwrite, stage)
         backups = {}
         installed = []

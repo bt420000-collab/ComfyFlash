@@ -18,8 +18,10 @@ class PromptFormatMetadataTests(unittest.TestCase):
             "t4": "MiniMax H3-Image Edit",
             "t5": "MiniMax H3 I2VA",
             "t6": "MiniMax H3 Ref2VA",
+            "t8": "H3 TARA motion_transfer",
         }
-        self.assertEqual(set(TONES), set(expected))
+        self.assertEqual(set(TONES), set(expected) | {"t7"})
+        self.assertFalse(TONES["t7"].TONE["prompt_format"]["required"])
         for tone_id, expected_name in expected.items():
             with self.subTest(tone=tone_id):
                 metadata = TONES[tone_id].TONE.get("prompt_format")
@@ -33,10 +35,10 @@ class PromptFormatMetadataTests(unittest.TestCase):
     def test_tone_list_exposes_prompt_format_to_agents(self):
         flash = object.__new__(Flash)
         items = flash.tone_list()
-        self.assertEqual({item["tone"] for item in items}, {"t1", "t2", "t3", "t4", "t5", "t6"})
+        self.assertEqual({item["tone"] for item in items}, {"t1", "t2", "t3", "t4", "t5", "t6", "t7", "t8"})
         for item in items:
             with self.subTest(tone=item["tone"]):
-                self.assertTrue(item["prompt_format"]["required"])
+                self.assertEqual(item["prompt_format"]["required"], item["tone"] != "t7")
 
 
 if __name__ == "__main__":

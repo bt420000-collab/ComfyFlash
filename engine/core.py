@@ -6,7 +6,7 @@ Engine 负责的"标准控制面板"：
     prompt / image_in / video_in / audio_in / resolution / duration / seed / output
 Tone 只负责它自己的配方（模型、LoRA、采样器、条件拼装）。
 
-零服务：本模块不监听端口、不起子进程、不连 HTTP/WebSocket，也不要求 ComfyUI 在运行。
+零服务：本模块不监听端口、不连 HTTP/WebSocket，也不要求 ComfyUI 在运行。
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import artifact, contracts, h3, media, telemetry
+from . import artifact, contracts, h3, media, project_policy, telemetry
 from .contracts import ParamError
 from .bank import TONES
 from .runtime import Runtime
@@ -38,11 +38,19 @@ _MODEL_KINDS = {
     "vae_audio": "vae",
     "vae_image": "vae",
     "lora": "loras",
+    "lora_turbo": "loras",
 }
 
 # 同进程热复用，但不许把整套模型都攒在内存里：每类最多留几个。
 _CACHE_LIMITS = {"unet": 1, "patched_unet": 1, "clip": 1, "vae": 2, "lora": 2}
 _EXECUTION_LOCK = threading.RLock()
+
+
+def _request_spec(spec, request):
+    overrides = spec.get("models_by_scheduler", {}).get(request["advanced"].get("scheduler"))
+    if overrides:
+        return {**spec, "models": {**spec["models"], **overrides}}
+    return spec
 
 
 # --------------------------------------------------------------------- config
@@ -113,16 +121,39 @@ def _normalize_video(value, minimum_frames, fps, planned_videos):
     if not path.is_absolute():
         raise ParamError("BAD_INPUT", f"video_in requires an absolute path: {path}")
     try:
-        if path.resolve() not in planned_videos:
+        info = planned_videos.get(path.resolve())
+        if info is None:
             if not path.is_file():
                 raise FileNotFoundError(f"No such file: {path}")
-            info = media.probe_video(path)
-            duration = info.get("duration_s")
-            if duration is not None and duration <= (minimum_frames - 1) / fps:
-                raise ValueError(f"Video must provide at least {minimum_frames} frames at {fps} fps")
+            info = media.probe_video(path, source_geometry=fps is None)
+        duration = info.get("duration_s")
+        if fps is not None and duration is not None and duration <= (minimum_frames - 1) / fps:
+            raise ValueError(f"Video must provide at least {minimum_frames} frames at {fps} fps")
     except (OSError, ValueError, ImportError, RuntimeError) as exc:
         raise ParamError("BAD_INPUT", f"Unreadable reference video {path}: {exc}") from exc
-    return str(path)
+    return str(path), info
+
+
+def _source_video_geometry(info, scale):
+    rate = info.get("fps")
+    if not rate or rate <= 0:
+        raise ParamError("BAD_INPUT", "Cannot determine the source video's frame rate")
+    width, height = info["width"] * scale, info["height"] * scale
+    count = info.get("frame_count")
+    duration = count / rate if count else info.get("duration_s")
+    estimate = count or (round(duration * rate) if duration else 0)
+    if estimate:
+        # The native decoder holds both the source and 2× output as RGB tensors.
+        frame_bytes = (info["width"] * info["height"] + width * height) * 3 * 4
+        try:
+            import psutil
+            available = psutil.virtual_memory().available
+        except (ImportError, OSError, RuntimeError):
+            available = None
+        if available is not None and estimate * frame_bytes > available:
+            raise ParamError("INSUFFICIENT_RAM", "RelayVSR 的输入和输出帧超出当前可用内存，请缩短源视频或使用较小画布。")
+    return width, height, {"fps": rate, "requested_duration_s": duration,
+                           "requested_frame_count": count, "aligned_frame_count": count}
 
 
 @lru_cache(maxsize=64)
@@ -189,13 +220,15 @@ class _Run:
         with self.attempt.measure("model_load"):
             return self.engine.cached(("vae", path), self.rt.load_vae, path)
 
-    def with_lora(self, model):
+    def with_lora(self, model, *, role="lora", cache_patch=True):
         strength = float(self.params.get("lora_strength", 1.0))
         if strength == 0.0:
             return model
-        path = self._path("lora")
+        path = self._path(role)
         with self.attempt.measure("model_load"):
             lora = self.engine.cached(("lora", path), self.rt.load_lora, path)
+            if not cache_patch:
+                return self.rt.apply_model_lora(model, lora, strength)
             return self.engine.cached(
                 ("patched_unet", self._path("diffusion"), path, strength),
                 self.rt.apply_model_lora, model, lora, strength,
@@ -206,14 +239,18 @@ class _Run:
             return build(self.rt, *args, **kwargs)
 
     # ---- 采样
-    def sample(self, model, cond, latent):
+    def sample(self, model, cond, latent, *, negative=None):
         p = self.params
         if self.video:
-            self.meta["sampling"] = {key: p[key] for key in ("steps", "sampler", "scheduler", "cfg", "lora_strength")}
-            self.meta["sampling"]["lora"] = self.spec["models"]["lora"] if p["lora_strength"] else None
+            self.meta["sampling"] = {key: p[key] for key in ("steps", "sampler", "scheduler", "cfg", "lora_strength")
+                                     if key in p}
+            self.meta["sampling"]["lora"] = self.spec["models"].get("lora") if p.get("lora_strength", 1.0) else None
+            if "lora_turbo" in self.spec["models"]:
+                self.meta["sampling"]["lora_turbo"] = self.spec["models"]["lora_turbo"]
         noise = self.rt.prepare_noise(latent["samples"], self.seed)
         sigmas = h3.PIKA_SIGMAS if p["scheduler"] == "pika" else None
-        negative = None if sigmas is not None and p["cfg"] == 1.0 else h3.zero_out(cond)
+        if negative is None and (sigmas is None or p["cfg"] != 1.0):
+            negative = h3.zero_out(cond)
         with self.timed_stage("sampling"), self.rt.stage():
             out = self.rt.sample_latent(
                 model,
@@ -231,9 +268,9 @@ class _Run:
         return {"samples": out}
 
     # ---- 解码 / 落盘
-    def _offload_for_decode(self):
+    def _offload_for_decode(self, *, force=False):
         """Release model residency before the first decoder while keeping its latents."""
-        if self.rt.dynamic_vram and not self.engine._cfg.get("video_decode_offload", False):
+        if not force and self.rt.dynamic_vram and not self.engine._cfg.get("video_decode_offload", False):
             return
         if getattr(self, "_offloaded", False):
             return
@@ -294,12 +331,15 @@ class _Run:
             runtime.update(self.rt.video_acceleration(), decode_offloaded=getattr(self, "_offloaded", False))
         sampling = self.meta.get("sampling", {key: self.params[key] for key in ("steps", "sampler", "scheduler", "cfg")
                                              if key in self.params})
+        provenance = {"inputs": sources, "requested_resolution": self.req["resolution"]}
+        if approval := self.req.get("production_approval"):
+            provenance["production_approval"] = approval
         return {**self.meta, "tone": self.spec["id"], "tone_version": self.spec.get("version"),
                 "seed": self.seed, "request_id": self.req.get("request_id"), "models": models,
                 "runtime": runtime, "sampling": sampling,
                 "effective_controls": {"prompt": self.prompt, "width": self.width, "height": self.height,
                                        **self.params},
-                "provenance": {"inputs": sources, "requested_resolution": self.req["resolution"]}}
+                "provenance": provenance}
 
     def save_video(self, frames, audio=None):
         total = int(frames.shape[0])
@@ -475,12 +515,24 @@ class Flash:
             })
         info["models"] = deps
         info["models_ready"] = all(item["exists"] for item in deps)
+        if spec.get("plugins"):
+            info["plugins"] = self._plugin_dependencies(spec)
+            info["plugins_ready"] = all(item["exists"] for item in info["plugins"])
         info["device"] = self._cfg.get("device", "cuda:0")
         return info
 
     # ------------------------------------------------------------- 演奏
+    def _plugin_dependencies(self, spec):
+        root = Path(self._cfg["comfyui_root"]).expanduser() / "custom_nodes"
+        return [{**item, "path": str(root / item["file"]), "exists": (root / item["file"]).is_file()}
+                for item in spec.get("plugins", ())]
+
     def _check_models(self, spec):
-        return {key: self.model_path(name, _MODEL_KINDS[key]) for key, name in spec.get("models", {}).items()}
+        models = {key: self.model_path(name, _MODEL_KINDS[key]) for key, name in spec.get("models", {}).items()}
+        for item in self._plugin_dependencies(spec):
+            if not item["exists"]:
+                raise ParamError("MISSING_PLUGIN", f"缺少 {item['name']}：{item['path']}。来源 {item['source']}")
+        return models
 
     def validate_request(self, tone=None, prompt=None, image_in=None, audio_in=None, resolution=None,
                          duration=None, seed=None, output=None, verbose=None, *, video_in=None,
@@ -491,9 +543,12 @@ class Flash:
         spec = self._spec(tone)
         req = self._resolve(spec, prompt, image_in, audio_in, resolution, duration, seed, output, advanced,
                             planned_images=_planned_images, video_in=video_in, planned_videos=_planned_videos)
-        paths = self._check_models(spec)
+        paths = self._check_models(_request_spec(spec, req))
         summary = {key: req.get(key) for key in ("output", "overwrite", "resolution", "width", "height", "seed",
-                                                 "requested_duration_s", "requested_frame_count", "aligned_frame_count")}
+                                                 "requested_duration_s", "requested_frame_count", "aligned_frame_count",
+                                                 "fps")}
+        if approval := req.get("production_approval"):
+            summary["production_approval"] = approval
         return {"ok": True, "tone": tone, "model_paths": paths, **summary}
 
     def preflight(self, tone, prompt=None, image_in=None, audio_in=None, resolution=None,
@@ -506,7 +561,7 @@ class Flash:
             req = self._resolve(spec, prompt, image_in, audio_in, resolution, duration, seed, output, advanced,
                                 video_in=video_in)
             seed_value = req["seed"]
-            self._check_models(spec)
+            self._check_models(_request_spec(spec, req))
             return {"ok": True, "tone": tone, "resolved": req}
         except ParamError as exc:
             return self._fail(tone, seed_value, exc, None, started, exc.code)
@@ -558,6 +613,7 @@ class Flash:
                 req = self._resolve(spec, prompt, image_in, audio_in, resolution, duration, seed, output, advanced,
                                     video_in=video_in)
                 seed_value = req["seed"]
+                spec = _request_spec(spec, req)
                 attempt.configure(spec, req, self._cfg)
                 self._check_models(spec)
 
@@ -656,10 +712,14 @@ class Flash:
         err = {"code": code, "message": message}
         if code == "OOM" or "out of memory" in message.lower():
             err["code"] = "OOM"
-            err["hint"] = (
-                "显存不足。可缩小 resolution，视频可缩短 duration。"
-                "16GB 单卡短视频对照设置为 768x448、1.6 秒，图像对照设置为 1k。"
-            )
+            module = TONES.get(str(tone))
+            if module and module.TONE.get("upscale_factor"):
+                err["hint"] = "显存不足。可先截取较短片段或使用较小画布的源视频，再执行超分。"
+            else:
+                err["hint"] = (
+                    "显存不足。可缩小 resolution，视频可缩短 duration。"
+                    "16GB 单卡短视频对照设置为 768x448、1.6 秒，图像对照设置为 1k。"
+                )
         if detail:
             text = detail.strip()
             if text:
@@ -681,6 +741,7 @@ class Flash:
         required = list(inputs.get("required", []))
         accepted = required + list(inputs.get("optional", []))
         controls = spec.get("controls", {})
+        scale = spec.get("upscale_factor")
 
         if prompt is None and "prompt" in required:
             raise ParamError("MISSING_INPUT", f"{spec['name']} requires prompt")
@@ -712,8 +773,9 @@ class Flash:
         if video_in is not None:
             if "video_in" not in accepted:
                 raise ParamError("UNSUPPORTED_INPUT", f"{spec['name']} does not accept video_in")
-            video["video_path"] = _normalize_video(video_in, controls["video_in"]["min_frames"],
-                                                   spec["temporal"]["fps"], planned_videos or ())
+            video["video_path"], video_info = _normalize_video(
+                video_in, controls["video_in"]["min_frames"], spec.get("temporal", {}).get("fps"), planned_videos or {},
+            )
         elif "video_in" in required:
             raise ParamError("MISSING_INPUT", f"{spec['name']} requires video_in")
 
@@ -741,7 +803,19 @@ class Flash:
             raise ParamError("BAD_OUTPUT", f"Output parent cannot be created or written: {out_path.parent}")
 
         advanced = dict(advanced)
+        proof = {}
+        if spec["output"] == "video" and not scale:
+            approval = project_policy.check_video_approval(
+                out_path, spec["id"], prompt, images, video.get("video_path"), advanced.pop("production_approval", None),
+            )
+            if approval:
+                proof["production_approval"] = approval
         timing = contracts.resolve_time(spec, duration, advanced.pop("fps", None))
+        if spec.get("temporal", {}).get("cap_to_reference"):
+            if video_info.get("duration_s") is not None:
+                contracts.cap_reference_frames(timing, spec["temporal"],
+                                               round(video_info["duration_s"] * timing["fps"]))
+            video["source_audio"] = video_info.get("audio_present", False)
         delivery = contracts.resolve_delivery(spec, advanced)
         for destination in artifact.output_paths(out_path, spec["output"]).values():
             if destination.is_dir() or delivery["overwrite"] and destination.is_symlink():
@@ -749,18 +823,29 @@ class Flash:
             if not delivery["overwrite"] and (destination.exists() or destination.is_symlink()):
                 raise ParamError("OUTPUT_EXISTS", f"Output already exists: {destination}; set overwrite=true to replace it")
         if seed is None:
-            seed_value = random.SystemRandom().randrange(0, 2 ** 31)
+            seed_value = controls.get("seed", {}).get("default")
+            if seed_value is None:
+                seed_value = random.SystemRandom().randrange(0, 2 ** 31)
         else:
             seed_value = contracts.scalar_value("seed", seed, controls.get("seed", {"type": "integer"}), "BAD_SEED") % (2 ** 63)
 
-        decl = controls["resolution"]
-        res_value = decl["default"] if resolution is None else resolution
-        res_value = contracts.scalar_value("resolution", res_value, decl, "BAD_RESOLUTION")
-        width, height = contracts.resolve_canvas(spec, res_value, image_size)
         params = contracts.resolve_advanced(spec, advanced)
+        if scale:
+            if resolution is not None:
+                raise ParamError("UNSUPPORTED_CONTROL", f"{spec['name']} determines the output size from the source video")
+            res_value = None
+            if params.get("upscale_preset") == "default":
+                params["upscale_preset"] = spec["advanced"]["upscale_preset"]["default"]
+            width, height, timing = _source_video_geometry(video_info, scale)
+            video["source_audio"] = video_info.get("audio_present", False)
+        else:
+            decl = controls["resolution"]
+            res_value = decl["default"] if resolution is None else resolution
+            res_value = contracts.scalar_value("resolution", res_value, decl, "BAD_RESOLUTION")
+            width, height = contracts.resolve_canvas(spec, res_value, image_size)
         return {
             "prompt": prompt, "images": images, "input_artifacts": input_artifacts, "output": str(out_path),
             "width": width, "height": height, "frames": timing.get("aligned_frame_count"),
             "duration": timing.get("requested_duration_s"), "seed": seed_value,
-            "resolution": res_value, "advanced": params, **timing, **delivery, **video,
+            "resolution": res_value, "advanced": params, **timing, **delivery, **video, **proof,
         }

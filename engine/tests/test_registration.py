@@ -32,6 +32,10 @@ class RegistrationTests(unittest.TestCase):
 
     def models_for(self, *tones):
         for tone in tones:
+            for plugin in TONES[tone].TONE.get("plugins", ()):
+                path = self.comfy / "custom_nodes" / plugin["file"]
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.touch()
             for role, filename in TONES[tone].TONE["models"].items():
                 path = self.weights / _MODEL_KINDS[role] / filename
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -91,6 +95,22 @@ class RegistrationTests(unittest.TestCase):
         self.assertIn("tone-info", result["tone_info_argv"])
         self.assertIn("prompt-ref", result["prompt_ref_argv"])
 
+    def test_production_video_registration_writes_a_persistent_policy_and_guide(self):
+        self.models_for(*TONES)
+        self.args.video_workflow = "cinespindle"
+        with patch.object(agent, "cinespindle_guide", return_value=self.root / "CineSpindle" / "H3_WORKFLOW.md"):
+            result = self.run_registration()
+            self.args.video_workflow = None
+            again = self.run_registration()
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["video_workflow"], "cinespindle")
+        self.assertEqual(again["video_workflow"], "cinespindle")
+        policy = self.project / ".comfyflash-project.json"
+        self.assertEqual(agent.read_json(policy), {"video_workflow": "cinespindle"})
+        guide = Path(result["guide"]).read_text(encoding="utf-8")
+        self.assertIn("h3-plan", guide)
+        self.assertIn("h3-run", guide)
+
     def test_discover_reports_guide_and_schema_without_loading_the_runtime(self):
         self.models_for(*TONES)
         self.run_registration()
@@ -123,6 +143,20 @@ class RegistrationTests(unittest.TestCase):
         self.assertEqual(len(result["missing_models"]), 9)
         self.assertFalse(self.args.config.exists())
         self.assertFalse(any(self.project.iterdir()))
+
+    def test_missing_optional_upscale_models_do_not_block_h3_registration(self):
+        self.models_for("t1", "t2", "t3", "t4", "t5", "t6")
+        result = self.run_registration()
+        self.assertTrue(result["ok"], result)
+        upscale = next(item for item in result["functions"] if item["tone"] == "t7")
+        self.assertFalse(upscale["ready"])
+        for tone, count in (("t7", 2), ("t8", 1)):
+            self.assertEqual(sum(tone in item["tones"] for item in result["optional_missing_models"]), count)
+            self.assertEqual(result["optional_download_argv_by_tone"][tone][-2:], ["--tone", tone])
+        tara = next(item for item in result["functions"] if item["tone"] == "t8")
+        self.assertFalse(tara["ready"])
+        self.assertEqual(tara["missing_plugins"][0]["name"], "ComfyUI-BFSNodes")
+        self.assertEqual(result["optional_download_argv"][-2:], ["--tone", "t7"])
 
     def test_registration_honors_explicit_acceleration_settings(self):
         self.models_for(*TONES)

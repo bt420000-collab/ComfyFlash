@@ -19,6 +19,8 @@ python -B engine/agent.py tone-info t2
 | `t4` H3 图片编辑 | `prompt`、`image_in` | 图片 | 单段英文描述，依次写 `<Picture 1>` 源图、目标画面和具体改动 |
 | `t5` Pika 首帧生视频 | `prompt`、`image_in` | 带同期声的视频 | I2VA 首帧对齐句与 T2VA 三段结构 |
 | `t6` Pika 多参考生视频 | `prompt`、`image_in` | 带同期声的视频 | Ref2VA 六段，图片按输入顺序编号，可选动作视频用 `<Video 1>` |
+| `t7` 视频超分 | `video_in` | RelayVSR 2× | 无需提示词 |
+| `t8` H3 TARA 动作迁移 | `prompt`、`image_in`、`video_in` | 沿用动作视频音轨 | `motion_transfer:` 加 Ref2VA 六段 |
 
 首次使用一种模式前查看 `prompt_guide_ref` 中对应的图像或视频小节。只有用户明确要求逐字传入时才直接使用原文。逐字传入 `t4` 时可设置 `"prompt_prefix": ""` 关闭自动添加的编辑前缀。 [H3 提示词指南](../engine/skills/comfyflash/SKILL.md#prepare-the-prompt)
 
@@ -37,15 +39,51 @@ python -B engine/agent.py prompt-ref t2 --query "product advertising"
 
 ## 请求参数
 
-- `tone`、`prompt` 和绝对输出路径 `output` 必填。图片可写 `.png`、`.jpg`、`.jpeg`、`.webp`、`.bmp`，视频可写 `.mp4`、`.mov`、`.mkv`。视频使用 H.264 与 AAC。
-- `t2`、`t4` 和 `t5` 各接收一张图片，`t6` 接收 1–9 张有序图片。`image_in` 支持绝对路径、图像 Artifact 或符合数量要求的数组。`t6` 的可选 `video_in` 为单个本地视频绝对路径，按 24 fps 取样后至少需 5 帧。所有 Tone 的 `audio_in` 可省略或设为 `null`。视频同期声由模型生成。
+- `tone` 和绝对输出路径 `output` 必填。`t1`–`t6` 还需 `prompt`。图片可写 `.png`、`.jpg`、`.jpeg`、`.webp`、`.bmp`，视频可写 `.mp4`、`.mov`、`.mkv`。视频使用 H.264 与 AAC。
+- `t2`、`t4` 和 `t5` 各接收一张图片，`t6` 接收 1–9 张，`t8` 接收 1–4 张有序图片。`image_in` 支持绝对路径、图像 Artifact 或符合数量要求的数组。`t6` 的 `video_in` 可选，`t8` 的 `video_in` 必填，均按 24 fps 取样且至少需 5 帧。所有 Tone 的 `audio_in` 可省略或设为 `null`。`t1`、`t2`、`t5` 和 `t6` 生成同期声，`t7` 和 `t8` 保留源音轨。
 - `seed` 可传整数以复用种子，省略或传 `null` 时随机生成。以实际生成结果中的 `seed` 为准。
 - 视频 `resolution` 支持 `16:9`、`9:16`、`1:1`、`4:3`、`3:4`、`21:9`、`720p` 与自定义 `WxH`。`720p` 等于 `16:9` 的 `1344x768`。自定义画布宽高均以 32 像素为步长，短边至少 256 像素，面积至多为 768 × 1344 像素。
 - 图片 `resolution` 支持 `1k`、`2k`、`max`、`16:9`、`9:16`、`1:1`、`4:3`、`3:4` 与自定义 `WxH`。比例预设以 1024 × 1024 像素为目标面积，并将宽高对齐 32 像素。自定义画布的宽高均为 32 像素的正整数倍，面积至多为 3104 × 3104 像素。`t4` 的 `match` 保持输入比例，将短边限制在 1024–2048 像素并对齐 32 像素。需要指定像素尺寸时用 `WxH`。
-- 视频 `duration` 的请求范围为 1–15 秒，缺省为 5 秒，帧率固定为 24 fps。引擎先将 `duration × 24` 舍入为最接近的整数帧，恰逢半帧时取偶数，再向上对齐到 `17n+5`。5 秒请求从 120 帧对齐到 124 帧，交付 124 帧时约为 5.167 秒。图片的 `duration` 和 `fps` 均可省略或填 `null`。
-- 视频默认使用 Pika 固定 sigma、6 步 LCM 和 CFG 1。可用 `sampler="lcm"` 或 `scheduler="pika"` 选择六步配方。旧版采样组合可传 `steps=20, sampler="res_multistep", scheduler="simple"`，选择旧预设时省略的采样器和步数按旧版默认值补齐。图像使用 PDD 六步配方。各 Tone 的有效范围以 `tone-info` 为准。
+- H3 生视频的 `duration` 范围为 1–15 秒，缺省为 5 秒，帧率固定为 24 fps。引擎先将 `duration × 24` 舍入为最接近的整数帧，恰逢半帧时取偶数，再向上对齐到 `17n+5`。5 秒请求从 120 帧对齐到 124 帧，交付 124 帧时约为 5.167 秒。图片和视频超分的 `duration`、`fps` 均可省略或填 `null`。
+- H3 生视频默认使用 Pika 固定 sigma、6 步 LCM 和 CFG 1。可用 `sampler="lcm"` 或 `scheduler="pika"` 选择六步配方。旧版采样组合可传 `steps=20, sampler="res_multistep", scheduler="simple"`，选择旧预设时省略的采样器和步数按旧版默认值补齐。图像使用 PDD 六步配方。各 Tone 的有效范围以 `tone-info` 为准。
 
 请求 Schema 描述标准 JSON 值。`x-path`、`x-canvas`、`x-temporal` 和 `x-sampling-policy` 补充宿主文件系统、画布限制、帧网格和采样组合约束，由预检执行。Python 调用也接受 `Path`、单元素参考图元组和契约中声明允许的数值文本。
+
+## 视频超分
+
+`t7` 使用 ComfyUI 自带的 RelayVSR 节点，固定以 Euler / Simple、CFG 1 采样一步，默认 `seed=42`、`detail=1`。输入源视频的绝对路径，沿用源帧率和帧数，随片交付 AAC 音轨（如果源片带音轨）。VFR 源片按标称帧率编码为固定帧率。预检会估算输入和 2× 输出帧所占的内存。
+
+`t7` 固定使用 RelayVSR 2×。`upscale_preset` 可省略，旧请求中的 `default` 和 `relayvsr` 都会走同一配方。旧组合超分请求需删除 `upscale_preset` 或改成 `relayvsr`。用 `tone-info t7` 查看配方和权重信息。
+
+`protect_source` 默认开启。RelayVSR 会参考前后关键帧，在快速运动或遮挡变化时可能把后面的结构提前带进当前帧。保护会将严重偏离当前输入帧的大块颜色和轮廓局部回混到双三次放大结果。成品元数据 `source_protected_frames` 记录参与回混的帧数。需要对照模型原始输出时可传 `"protect_source": false`。
+
+```json
+{"tone":"t7","video_in":"D:/shots/source.mp4","output":"D:/shots/upscaled.mp4"}
+```
+
+通过 `tone-info t7` 检查两份权重的路径。缺失时登记报告会返回 `optional_missing_models` 和 `optional_download_argv`，得到确认后可用 `download-models --tone t7 --yes` 补齐。 [上游模型与工作流](https://huggingface.co/Comfy-Org/RelayVSR)
+
+## H3 TARA 动作迁移
+
+`t8` 接受 1–4 张有序参考图和一个动作视频。提示词以 `motion_transfer:` 开头，沿用 H3 Ref2VA 六段结构。用 `<Picture N>` 指定角色、服装或场景，用 `<Video 1>` 指定要跟随的动作、表情、节奏与运镜。参考视频从片首按 24 fps 取样，输出帧数向下对齐到源片能覆盖的 `17k+5` 网格。有音轨时随成片输出。
+
+这版使用 H3 Ref2VA 和 INT8 视频 VAE。默认叠加 TARA 动作 LoRA 和 Pika Ref2VA 加速 LoRA，各用强度 1，以 LCM / Pika、CFG 1 采样 6 步。默认 `672x384`、`duration=4.5`。参考图默认按 `max` 模式处理，每张图先限制在 1 MP。显存紧张时可传 `"ref_image_size": "match"`。
+
+传 `"steps": 8` 或 `"scheduler": "simple"` 可选择 DMD 八步配方，使用 Euler / Simple、CFG 1。将额外的 DMD Turbo LoRA 放入模型目录的 `loras` 子目录。 [DMD Turbo 权重](https://huggingface.co/drbaph/MiniMax-H3-Turbo-Lora-ComfyUI/resolve/main/experimental/minimax_h3_dmd_ref2va_8step_turbo_pruned.safetensors)
+
+PyTorch 提供原生 FlashAttention 时使用 Flash Partitions，否则使用已安装的 Comfy Kitchen 兼容路径。成片元数据会记录使用的注意力后端。BFSNodes 的额外内核下载需要显式开启。
+
+`tone-info t8` 会报告默认配方的两份 LoRA 和 ComfyUI-BFSNodes 的本机状态。经用户确认后可用 `download-models --tone t8 --yes` 补齐默认模型。 [上游 TARA 工作流与提示词指南](https://huggingface.co/Alissonerdx/Minimax-H3-ComfyUI/blob/main/docs/motion-transfer.md) · [BFSNodes](https://github.com/alisson-anjos/ComfyUI-BFSNodes)
+
+### TARA 连续镜头接缝
+
+同一镜头需要分段时，优先试验**潜变量锚定续写**。当前 `t8` 按单段调用，跨段锚定是本地验证过的实验方案，请求参数仍以 `tone-info t8` 返回的契约为准。固定种子、参考图顺序和身份描述有助于复现，但独立片段从各自的第 0 帧采样。同一时刻的局部帧位和动作上下文会变，发丝、裙边和尾巴仍可能跳变。
+
+1. 用原动作视频的同一条 24 fps 时间线切窗，记录每段的起始帧。窗口长度按 `17k+5` 对齐，步长按 17 帧对齐。实测用 73 帧窗口、68 帧步长，保留 5 帧重叠。
+2. 把上一段末尾的全部重叠帧编码到下一段输出潜变量的开头，在采样时用 H3 去噪遮罩锁住对应位置。动作视频仍按原时间线输入 TARA，下一段沿锚点续写。后续实现可优先交接对齐的原潜变量，省掉重叠帧的重复编解码。TARA 的原生时序模式与普通 `Add Guide` 首帧条件互斥。 [TARA 原生时序实现](https://github.com/alisson-anjos/ComfyUI-BFSNodes/blob/main/minimax_h3_native_temporal.py) · [H3 潜变量尾段续写](https://github.com/DrakenZA/Comfyui-H3-DrakenNodes)
+3. 拼接时沿用前段的重叠原帧，从后段第一帧未锁定画面接入，音轨继续按原时间线走。检查接点及其后数帧的头发、手、衣料和尾巴。轮廓错位时，整帧淡化容易产生双影。
+
+单个固定机位的舞蹈接缝已实测。原生 `1152x864`、Pika 6 步、`seed=42`，锁定 5 个画面帧对应的 2 个时间潜帧，在去噪期间保持原值。同一切点的人物区域相邻帧 RGB 平均绝对差由 17.26 降到 7.97（0–255），仍有轻微变化。后续可以对照 22 帧重叠。已有成片的个别接缝可试验锁住前后两端，只重生成中间内容，按原帧号替换。
 
 ## 命令行与 Python
 
@@ -97,6 +135,14 @@ with Flash() as flash:
 ```
 
 `Flash.validate_request()` 是兼容入口，成功时返回验证摘要，错误时通过异常报告。`Flash.play()` 和 `Flash.preflight()` 的请求失败返回 `ok: false` 与 `error.code`、`error.message`。常见错误包括缺少输入 `MISSING_INPUT`、图片不可读 `BAD_INPUT`、输入数量错误 `BAD_INPUT_COUNT`、控制项不适用 `UNSUPPORTED_CONTROL`、缺少权重 `MISSING_MODEL`，以及显存不足 `OOM`。`verbose=True` 可在 Python 成功结果附带 `log`，推理错误的 `error.detail` 可包含尾部日志。遇到 `OOM` 时，引擎会清理模型和会话缓存，之后可继续使用同一会话。
+
+## CineSpindle 影视项目
+
+用 `python -B engine/agent.py register --project "<项目目录>" --video-workflow cinespindle` 启用逐镜视频审查。登记会在项目根目录写入 `.comfyflash-project.json`，生成的 Skill 会链接本机 CineSpindle。子目录继承这项规则。
+
+从该项目运行、或把视频输出写入该项目时，CLI 和 Python API 都要求逐镜计划。CineSpindle 的 `h3-run` 会传入 `production_approval`，内含 `plan` 的本地 JSON 绝对路径和 `stage`。R2 成片另带 `motion_review` 的本地 JSON 绝对路径。引擎重新核对 Tone、图片顺序、文件摘要和已审动作底片。计划和动作审查文件需在登记项目内。生图、图片编辑以及常规未登记项目的原生视频入口沿用原请求格式。
+
+缺逐镜计划返回 `PRODUCTION_APPROVAL_REQUIRED`。计划无效或素材已变动返回 `PRODUCTION_APPROVAL_INVALID`。可用 `h3-run --dry-run` 验证派发条件。通过的计划编号、镜头、路线和阶段保存在 `artifact.provenance.production_approval`。
 
 ## 批量执行与设备
 

@@ -97,6 +97,14 @@ def request_schema(spec):
              "verbose": {"type": ["boolean", "null"]}, "audio_in": {"type": "null"}}
     if "image_in" not in inputs.get("fields", {}):
         props["image_in"] = {"type": "null"}
+    if spec["output"] == "video" and not spec.get("upscale_factor"):
+        local_json = {"type": "string", "minLength": 1, "x-path": "absolute-readable-json"}
+        props["production_approval"] = {
+            "type": "object", "required": ["plan", "stage"], "additionalProperties": False,
+            "properties": {"plan": local_json, "stage": {"enum": ["motion", "final"]},
+                           "motion_review": local_json},
+            "description": "Required by projects that opted into the CineSpindle video workflow.",
+        }
     for key, decl in {**spec.get("controls", {}), **spec.get("advanced", {}), **delivery_controls(spec)}.items():
         if key == "image_in":
             field = inputs["fields"][key]
@@ -109,7 +117,8 @@ def request_schema(spec):
             props[key] = {"oneOf": forms, "x-role": field["role"]}
         elif key == "video_in":
             field = inputs["fields"][key]
-            props[key] = {**scalar_schema(decl), "type": ["string", "null"], "minLength": 1,
+            props[key] = {**scalar_schema(decl), "type": "string" if key in inputs["required"] else ["string", "null"],
+                          "minLength": 1,
                           "x-path": "absolute-readable-video", "x-role": field["role"],
                           "x-min-frames": decl["min_frames"]}
         else:
@@ -130,10 +139,15 @@ def request_schema(spec):
         props.update(duration={"type": "null"}, fps={"type": "null"})
     if "sampling_policy" in spec:
         policy = spec["sampling_policy"]
-        preset = spec["presets"][policy["default_preset"]]
         key = policy["selector"]
-        schema["allOf"] = [{"if": {"required": [key], "properties": {key: {"const": preset[key]}}},
-                            "then": {"properties": {k: {"const": preset[k]} for k in policy["fixed_controls"]}}}]
+        fixed_presets = [spec["presets"][policy["default_preset"]]]
+        if policy.get("strict_custom"):
+            fixed_presets.append(spec["presets"][policy["custom_preset"]])
+        schema["allOf"] = [
+            {"if": {"required": [key], "properties": {key: {"const": preset[key]}}},
+             "then": {"properties": {k: {"const": preset[k]} for k in policy["fixed_controls"]}}}
+            for preset in fixed_presets
+        ]
         schema["x-sampling-policy"] = {**policy, "presets": spec["presets"]}
     return schema
 
@@ -157,8 +171,9 @@ def resolve_advanced(spec, provided):
     selector = policy["selector"]
     fixed = policy["fixed_controls"]
     matches_default = all(params[k] == default[k] for k in fixed)
+    strict_custom = policy.get("strict_custom", False)
     if selector not in provided and provided.keys() & set(policy["implicit_custom_keys"]):
-        if policy["explicit_default_key"] not in provided or not matches_default:
+        if not matches_default or (not strict_custom and policy["explicit_default_key"] not in provided):
             params[selector] = custom[selector]
     if params[selector] == default[selector]:
         if not matches_default:
@@ -168,6 +183,9 @@ def resolve_advanced(spec, provided):
         for key in fixed:
             if key not in provided:
                 params[key] = custom[key]
+        if strict_custom and any(params[k] != custom[k] for k in fixed):
+            raise ParamError("BAD_PARAM", f"{selector}={custom[selector]} requires " +
+                             ", ".join(f"{k}={custom[k]}" for k in fixed))
     return params
 
 
@@ -191,6 +209,14 @@ def resolve_time(spec, duration, fps):
         raise ParamError("BAD_DURATION", f"Aligned frame count {aligned} exceeds limit {grid['max_frames']}")
     return {"requested_duration_s": seconds, "requested_frame_count": requested,
             "aligned_frame_count": aligned, "fps": rate}
+
+
+def cap_reference_frames(timing, grid, available_frames):
+    limit = min(timing["aligned_frame_count"], available_frames)
+    count = limit - (limit - grid["frame_offset"]) % grid["frame_step"]
+    if count < grid["min_frames"]:
+        raise ParamError("BAD_INPUT", f"Motion reference needs at least {grid['min_frames']} frames")
+    timing["aligned_frame_count"] = count
 
 
 def resolve_canvas(spec, value, image_size):

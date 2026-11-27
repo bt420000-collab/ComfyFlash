@@ -4,7 +4,7 @@
 
 ![ComfyFlash artwork showing an AI agent using a local image and video inference engine](docs/assets/comfyflash-home-hero.png)
 
-**v0.2.1** · Local image and video inference for AI agents.
+**v0.2.2** · Local image and video inference for AI agents.
 
 ComfyFlash exposes verified ComfyUI inference recipes as directly callable Tones. Agents select the capability and parameters for each task. One call runs inference on your machine and returns the generated media and its inspection files. The CLI starts on demand and exits when the job finishes. Your agent client may still meter conversation and tool use.
 
@@ -32,6 +32,8 @@ Registration saves local settings to `models/config.json`. Use `--comfyui-root`,
 | `t4` | H3 image editing | Prompt and one source image | Image |
 | `t5` | Pika first-frame video | Prompt and one first-frame image | Video with generated audio |
 | `t6` | Pika multi-reference video | Prompt, 1–9 reference images, and an optional motion reference video | Video with generated audio |
+| `t7` | Video upscale | Local source video | RelayVSR 2× with source frame rate and audio |
+| `t8` | H3 TARA motion transfer | Reference pictures, a driving video, and a prompt | Transfers the driving performance and timing, with the source soundtrack |
 
 ```text
 python -B engine/agent.py tone-list

@@ -15,6 +15,7 @@ from urllib.request import urlopen
 
 VIDEO_REVISION = "MiniMax-H3/resolve/4b53a35191437de05370da548e59aeabe2a5a09a"
 IMAGE_REVISION = "MiniMax-H3-Image/resolve/0bb149f51e3156ed4b90dd45d5620346bfe1df8f"
+RELAYVSR_REVISION = "RelayVSR/resolve/202c35eb0a5bb64b7017d5a09ea9acea87b7a081"
 INSTALL_GUIDE = "https://docs.comfy.org/installation"
 MODEL_LICENSES = [
     "https://huggingface.co/Comfy-Org/MiniMax-H3",
@@ -49,6 +50,27 @@ ARTIFACTS = {
          1956172304, "de3745ceb7d8d5c20898dd8fa3a05f1c0b00089ccd55297b2a8bab95c766b0e0"),
     )
 }
+ARTIFACTS.update({
+    Path(path).name: {**artifact(RELAYVSR_REVISION, path, size, digest), "optional": True}
+    for path, size, digest in (
+        ("diffusion_models/relayvsr_x2_lightx2v_int8_convrot.safetensors", 5163295248,
+         "240e75e0c17cf2845d559b25254a230ff7458f81449d7a8c5e7e3fb8275c7b3c"),
+        ("vae/relayvsr_flash_vae_x2_fp32.safetensors", 127759464,
+         "b5bb0339acb5b52545911ea29a51b4c5b805776a779222b5a14591571f42e21c"),
+    )
+})
+ARTIFACTS.update({
+    "minimax_h3_motion_transfer_tara_v1.0_ref2va.safetensors": {
+        "bytes": 126417912, "sha256": "aca0a0c10387ba9715fc01378b9051d9c0733838a388cb4215d829f6c41d0f35",
+        "url": "https://huggingface.co/Alissonerdx/Minimax-H3-ComfyUI/resolve/main/loras/minimax_h3_motion_transfer_tara_v1.0_ref2va.safetensors",
+        "optional": True,
+    },
+    "minimax_h3_dmd_ref2va_8step_turbo_pruned.safetensors": {
+        "bytes": 2285989092, "sha256": "693f41129785f31a820d32100b698cdcc42182c27c291f37f47d1ca5f38f5c20",
+        "url": "https://huggingface.co/drbaph/MiniMax-H3-Turbo-Lora-ComfyUI/resolve/main/experimental/minimax_h3_dmd_ref2va_8step_turbo_pruned.safetensors",
+        "optional": True,
+    },
+})
 
 LIBRARIES = ("torch", "PIL.Image", "numpy", "av", "safetensors", "comfy_kitchen", "psutil")
 VERIFIED_VRAM_MIB = 16000

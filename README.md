@@ -4,7 +4,7 @@
 
 ![ComfyFlash 概念图，展示 Agent 调用本地推理引擎生成图片和视频](docs/assets/comfyflash-home-hero.png)
 
-**v0.2.1** · 面向 AI Agent 的本地图片与视频推理工具。
+**v0.2.2** · 面向 AI Agent 的本地图片与视频推理工具。
 
 ComfyFlash 把经过验证的 ComfyUI 推理配方封装成可直接调用的 Tone。Agent 按任务选择能力和参数，图片与视频在本机生成，一次调用即可拿到成品和检查结果。生成无需启动 ComfyUI 服务或访问云端生成 API。Agent 的对话和工具调度仍按客户端计量。
 
@@ -32,6 +32,8 @@ python -B engine/agent.py register
 | `t4` | H3 图片编辑 | 提示词、待编辑图 | 图片 |
 | `t5` | Pika 首帧生视频 | 提示词、首帧图片 | 带模型同期声的视频 |
 | `t6` | Pika 多参考生视频 | 提示词、1–9 张参考图、可选动作视频 | 带模型同期声的视频 |
+| `t7` | 视频超分 | 本地源视频 | RelayVSR 2×，保留源帧率和音轨 |
+| `t8` | H3 TARA 动作迁移 | 参考图、动作视频、提示词 | 按动作视频的表演和时序生成，沿用源音轨 |
 
 ```text
 python -B engine/agent.py tone-list
