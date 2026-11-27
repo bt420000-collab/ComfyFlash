@@ -20,7 +20,7 @@ python -B engine/agent.py register
 
 Use an existing ComfyUI installation and an NVIDIA CUDA environment that supports H3 inference. Start registration with Python 3.10 or newer. Registration finds a compatible inference interpreter. See the test report for the verified environment. [Test report (Chinese)](docs/TEST_REPORT.md) · [ComfyUI setup](https://docs.comfy.org/installation)
 
-[Installation video (Chinese)](https://www.bilibili.com/video/BV1oysv6xE3j) · [Video 2 (Chinese)](https://www.bilibili.com/video/BV1421pzuEN7/)
+[Installation video (Chinese)](https://www.bilibili.com/video/BV1oysv6xE3j) · [One-prompt motion recreation and upscaling demo (Chinese)](https://www.bilibili.com/video/BV1421pzuEN7/)
 
 Registration saves local settings to `models/config.json`. Use `--comfyui-root`, `--models-path`, or `--python` to select an existing installation. The registration report lists sources, sizes, and paths for any missing weights, which can be downloaded after approval. Install independent XCard tools under `xcard/<tool-name>/` for local discovery. [Example configuration](models/config.example.json) · [XCard discovery (Chinese)](xcard/README.md)
 
