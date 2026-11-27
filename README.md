@@ -18,7 +18,9 @@ ComfyFlash 把经过验证的 ComfyUI 推理配方封装成可直接调用的 To
 python -B engine/agent.py register
 ```
 
-登记需要已有的 ComfyUI 和可运行 H3 的 NVIDIA CUDA 推理环境。用 Python 3.10+ 启动登记即可，登记会查找可用的推理解释器。测试环境与硬件记录见[实测报告](docs/TEST_REPORT.md)。[安装视频（哔哩哔哩）](https://www.bilibili.com/video/BV1oysv6xE3j) · [ComfyUI 安装指南](https://docs.comfy.org/installation)
+登记需要已有的 ComfyUI 和可运行 H3 的 NVIDIA CUDA 推理环境。用 Python 3.10+ 启动登记即可，登记会查找可用的推理解释器。测试环境与硬件记录见[实测报告](docs/TEST_REPORT.md)。[ComfyUI 安装指南](https://docs.comfy.org/installation)
+
+[安装视频（哔哩哔哩）](https://www.bilibili.com/video/BV1oysv6xE3j) · [2 号视频（哔哩哔哩）](https://www.bilibili.com/video/BV1421pzuEN7/)
 
 登记成功后，本机设置写入 `models/config.json`。可用 `--comfyui-root`、`--models-path`、`--python` 指定已有安装。缺权重时，登记报告给出下载来源、大小和目标路径，得到用户确认后才下载。独立的 XCard 工具可放在 `xcard/<工具名>/` 下供 Agent 发现。[配置示例](models/config.example.json) · [XCard 接口](xcard/README.md)
 
